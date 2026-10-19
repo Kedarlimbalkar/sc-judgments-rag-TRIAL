@@ -19,7 +19,9 @@ from psycopg2.pool import ThreadedConnectionPool
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
 from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, status
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -847,8 +849,20 @@ async def article_stats_endpoint(article_number: str):
     return retrieval.query_article_mentions(clean)
 
 
-@app.get("/", tags=["System"])
-async def root():
+STATIC_INDEX_FILE = Path(__file__).parent / "static" / "index.html"
+
+
+@app.get("/", response_class=HTMLResponse, tags=["Frontend"])
+@app.get("/chat", response_class=HTMLResponse, tags=["Frontend"])
+async def root_chat():
+    """Serves the Supreme Court AI Legal Research Chatbot interface."""
+    if STATIC_INDEX_FILE.exists():
+        return HTMLResponse(content=STATIC_INDEX_FILE.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>Supreme Court of India - AI Judgments RAG Assistant Online</h1>")
+
+
+@app.get("/api/v1/info", tags=["System"])
+async def service_info():
     """Service metadata and OpenAPI status."""
     return {
         "service": "Supreme Court Judgments RAG Engine",

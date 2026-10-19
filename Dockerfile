@@ -36,6 +36,7 @@ COPY schema.sql .
 COPY online_app.py .
 COPY offline_pipeline.py .
 COPY entrypoint.sh .
+COPY static/ ./static/
 
 # Ensure entrypoint is executable and assign ownership to appuser
 RUN chmod +x entrypoint.sh && \
