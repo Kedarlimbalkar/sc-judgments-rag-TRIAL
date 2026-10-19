@@ -1,0 +1,70 @@
+# ==============================================================================
+# Cloud Build Configuration for Supreme Court Judgments RAG
+# Target Region: asia-south1
+# Artifact Registry: asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline
+# Cloud Run Job: sc-rag-offline-job
+# ==============================================================================
+
+steps:
+  # ----------------------------------------------------------------------------
+  # Step 1: Build the offline ingestion container image
+  # ----------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-offline-image'
+    args:
+      - 'build'
+      - '-t'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/offline-pipeline:$SHORT_SHA'
+      - '-t'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/offline-pipeline:latest'
+      - '-f'
+      - 'Dockerfile'
+      - '.'
+
+  # ----------------------------------------------------------------------------
+  # Step 2: Push container images to Google Artifact Registry
+  # ----------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-offline-image'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/offline-pipeline'
+
+  # ----------------------------------------------------------------------------
+  # Step 3: Deploy or update Cloud Run Job 'sc-rag-offline-job'
+  # ----------------------------------------------------------------------------
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-cloud-run-job'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'jobs'
+      - 'deploy'
+      - '${_JOB_NAME}'
+      - '--image=asia-south1-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/offline-pipeline:$SHORT_SHA'
+      - '--region=${_REGION}'
+      - '--command=python'
+      - '--args=offline_pipeline.py,--limit,0'
+      - '--set-env-vars=GCP_PROJECT=$PROJECT_ID,GCP_REGION=${_REGION},BUCKET_NAME=${_BUCKET_NAME},CLOUD_SQL_CONNECTION_NAME=${_CLOUD_SQL_INSTANCE}'
+      - '--set-cloudsql-instances=${_CLOUD_SQL_INSTANCE}'
+      - '--memory=4Gi'
+      - '--cpu=2'
+      - '--task-timeout=3600'
+      - '--max-retries=1'
+
+images:
+  - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/offline-pipeline:$SHORT_SHA'
+  - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/offline-pipeline:latest'
+
+substitutions:
+  _REGION: 'asia-south1'
+  _REPOSITORY: 'rag-repo'
+  _JOB_NAME: 'sc-rag-offline-job'
+  _BUCKET_NAME: 'sc-judgments-rag-sc-rag'
+  _CLOUD_SQL_INSTANCE: 'sc-judgments-rag:asia-south1:sc-rag-db'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+
