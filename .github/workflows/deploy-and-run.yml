@@ -67,3 +67,31 @@ jobs:
         run: |
           echo "Executing Cloud Run batch job (timeout 15m, 0 retries)..."
           gcloud run jobs execute sc-rag-offline-job --region=asia-south1 --wait
+
+      - name: Deploy Production Chatbot Web Service
+        run: |
+          echo "Deploying production Supreme Court RAG Chatbot Service..."
+          gcloud run deploy sc-rag-chatbot \
+            --image=asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest \
+            --region=asia-south1 \
+            --project=sc-judgments-rag \
+            --platform=managed \
+            --allow-unauthenticated \
+            --port=8080 \
+            --set-cloudsql-instances=sc-judgments-rag:asia-south1:sc-rag-db \
+            --set-env-vars=GCP_PROJECT=sc-judgments-rag,GCP_REGION=asia-south1,BUCKET_NAME=sc-judgments-rag-sc-rag,CLOUD_SQL_CONNECTION_NAME=sc-judgments-rag:asia-south1:sc-rag-db \
+            --memory=2Gi \
+            --cpu=1 \
+            --min-instances=0 \
+            --max-instances=5
+
+      - name: Output Live Production URL
+        run: |
+          PROD_URL=$(gcloud run services describe sc-rag-chatbot --region=asia-south1 --format='value(status.url)')
+          echo "=========================================================="
+          echo "🚀 PRODUCTION CHATBOT LIVE AT: $PROD_URL"
+          echo "📚 Interactive API Docs at: $PROD_URL/docs"
+          echo "=========================================================="
+          echo "## ⚖️ Production Supreme Court RAG Chatbot" >> $GITHUB_STEP_SUMMARY
+          echo "- **Live Chatbot UI**: [$PROD_URL]($PROD_URL)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Interactive API Docs**: [$PROD_URL/docs]($PROD_URL/docs)" >> $GITHUB_STEP_SUMMARY
