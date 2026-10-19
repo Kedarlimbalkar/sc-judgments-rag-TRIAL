@@ -915,10 +915,28 @@ class OfflineIngestionPipeline:
             self.storage_client = None
             self.bucket = None
 
+    def purge_stale_outputs(self):
+        """
+        Purges bad/stale Parquet files from 'parsed/' and 'chunks/' in GCS
+        to ensure only 100% freshly parsed high-quality data from 'raw/' is stored.
+        """
+        if not self.bucket:
+            logger.error("GCS bucket client not initialized; cannot purge stale outputs.")
+            return
+
+        logger.info("Operating in FRESH MODE: Cleaning bad/stale data from 'parsed/' and 'chunks/'...")
+        for pfx in [settings.GCS_PARQUET_PREFIX, settings.GCS_CHUNKS_PREFIX]:
+            stale_blobs = list(self.bucket.list_blobs(prefix=pfx))
+            if stale_blobs:
+                logger.info(f"Removing {len(stale_blobs)} stale file(s) from gs://{settings.BUCKET_NAME}/{pfx}...")
+                self.bucket.delete_blobs(stale_blobs)
+        logger.info("Purged stale output folders. Ready for 100% fresh ingestion from 'raw/'.")
+
     def discover_raw_blobs(self, prefix: str = settings.GCS_RAW_PREFIX) -> List[storage.Blob]:
         """
         Recursively lists all PDF blobs under the 'raw/' prefix in Cloud Storage.
-        Filters out directory placeholder markers and non-PDF files.
+        EXCLUSIVELY reads from 'raw/' as the single source of truth.
+        Never touches or relies on existing 'parsed/' or 'chunks/' data.
         """
         if not self.bucket:
             logger.error(f"GCS bucket '{settings.BUCKET_NAME}' client not initialized.")
@@ -928,30 +946,25 @@ class OfflineIngestionPipeline:
         if clean_prefix and not clean_prefix.endswith("/"):
             clean_prefix += "/"
 
-        logger.info(f"Discovering PDF files recursively under gs://{settings.BUCKET_NAME}/{clean_prefix} ...")
+        logger.info(f"FRESH INGESTION MODE: Scanning raw PDFs exclusively under gs://{settings.BUCKET_NAME}/{clean_prefix} ...")
         try:
             all_blobs = list(self.bucket.list_blobs(prefix=clean_prefix))
+            # Strict filter: only .pdf files under raw/ prefix
             pdf_blobs = [
                 b for b in all_blobs
-                if b.name.lower().endswith(".pdf") and not b.name.endswith("/")
+                if b.name.lower().endswith(".pdf")
+                and not b.name.endswith("/")
+                and not any(b.name.startswith(p) for p in ["parsed", "chunks", "exports", "logs"])
             ]
 
-            if not pdf_blobs:
-                # Fallback check: check unslashed prefix or list available top-level prefixes
-                fallback_blobs = list(self.bucket.list_blobs(prefix=clean_prefix.rstrip("/")))
-                pdf_blobs = [
-                    b for b in fallback_blobs
-                    if b.name.lower().endswith(".pdf") and not b.name.endswith("/")
-                ]
-
-            logger.info(f"Discovered {len(pdf_blobs)} raw PDF blob(s) in gs://{settings.BUCKET_NAME}/{clean_prefix}")
+            logger.info(f"Discovered {len(pdf_blobs)} fresh raw PDF blob(s) in gs://{settings.BUCKET_NAME}/{clean_prefix}")
             for p in pdf_blobs[:10]:
-                logger.info(f"  -> Found raw PDF: {p.name} ({p.size} bytes)")
+                logger.info(f"  -> Raw source PDF: {p.name} ({p.size} bytes)")
             if len(pdf_blobs) > 10:
-                logger.info(f"  -> ... and {len(pdf_blobs) - 10} more PDF(s).")
+                logger.info(f"  -> ... and {len(pdf_blobs) - 10} more raw PDF(s).")
             return pdf_blobs
         except Exception as e:
-            logger.error(f"Error discovering blobs in gs://{settings.BUCKET_NAME}: {e}")
+            logger.error(f"Error discovering raw blobs in gs://{settings.BUCKET_NAME}: {e}")
             return []
 
     def upload_parquet_dataset(
@@ -1116,11 +1129,20 @@ class OfflineIngestionPipeline:
             self.db.record_ingest_failure(blob.name, str(e), status="FAILED")
             return False
 
-    def run(self, limit: Optional[int] = settings.DEFAULT_INGEST_LIMIT, prefix: str = settings.GCS_RAW_PREFIX):
+    def run(
+        self,
+        limit: Optional[int] = settings.DEFAULT_INGEST_LIMIT,
+        prefix: str = settings.GCS_RAW_PREFIX,
+        purge_stale: bool = False,
+    ):
         """
         Executes GCS ingestion pipeline.
         If limit is 0 or None, processes ALL discovered GCS blobs.
+        If purge_stale is True, removes outdated outputs from parsed/ and chunks/ in GCS first.
         """
+        if purge_stale:
+            self.purge_stale_outputs()
+
         blobs = self.discover_raw_blobs(prefix=prefix)
         if not blobs:
             logger.warning(
@@ -1165,6 +1187,7 @@ class OfflineIngestionPipeline:
                     "bucket": settings.BUCKET_NAME,
                     "prefix": prefix,
                     "limit_requested": limit,
+                    "purge_stale": purge_stale,
                     "total_discovered": len(blobs),
                     "total_processed": len(target_blobs),
                     "success_count": success_count,
@@ -1209,6 +1232,13 @@ def main():
         help="GCS blob prefix to scan (default: raw/)"
     )
     parser.add_argument(
+        "--purge-stale",
+        "--fresh",
+        dest="purge_stale",
+        action="store_true",
+        help="Purge bad/stale Parquet files from 'parsed/' and 'chunks/' in GCS before ingesting from 'raw/'"
+    )
+    parser.add_argument(
         "--init-db",
         action="store_true",
         help="Execute schema.sql to initialize database extensions and tables in Cloud SQL"
@@ -1223,7 +1253,7 @@ def main():
     effective_limit = args.limit if args.limit and args.limit > 0 else 0
 
     pipeline = OfflineIngestionPipeline()
-    pipeline.run(limit=effective_limit, prefix=args.prefix)
+    pipeline.run(limit=effective_limit, prefix=args.prefix, purge_stale=args.purge_stale)
 
 
 if __name__ == "__main__":
