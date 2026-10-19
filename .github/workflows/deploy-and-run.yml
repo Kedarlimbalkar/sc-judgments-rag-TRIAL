@@ -1,38 +1,9 @@
-name: Deploy and Run Supreme Court Offline Ingestion Job
+name: Deploy and Run SC Judgments RAG Pipeline
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'offline_pipeline.py'
-      - 'config.py'
-      - 'schema.sql'
-      - 'requirements.txt'
-      - 'Dockerfile'
-      - '.github/workflows/deploy-and-run.yml'
-  schedule:
-    # Nightly run at 02:00 UTC (07:30 IST)
-    - cron: '0 2 * * *'
+    branches: [ "main" ]
   workflow_dispatch:
-    inputs:
-      execute_job:
-        description: 'Execute the Cloud Run Job immediately after deployment'
-        type: boolean
-        default: true
-      limit:
-        description: 'Batch PDF limit (0 = process all discovered GCS raw PDFs)'
-        type: string
-        default: '0'
-
-env:
-  GCP_PROJECT: 'sc-judgments-rag'
-  GCP_REGION: 'asia-south1'
-  ARTIFACT_REGISTRY: 'asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo'
-  IMAGE_NAME: 'offline-pipeline'
-  JOB_NAME: 'sc-rag-offline-job'
-  BUCKET_NAME: 'sc-judgments-rag-sc-rag'
-  CLOUD_SQL_INSTANCE: 'sc-judgments-rag:asia-south1:sc-rag-db'
 
 permissions:
   contents: read
@@ -40,100 +11,43 @@ permissions:
 
 jobs:
   deploy-and-run:
-    name: Build, Deploy & Execute Ingestion Job
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------------------
-      # Google Cloud Authentication
-      # Supports Workload Identity Federation (recommended) or GCP_SA_KEY secret
-      # ------------------------------------------------------------------------
       - name: Authenticate to Google Cloud
         id: auth
         uses: google-github-actions/auth@v2
         with:
-          # Workload Identity Federation (used if secrets are set)
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          # Service Account JSON Key fallback
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: 'projects/315039048199/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'github-actions-deployer@sc-judgments-rag.iam.gserviceaccount.com'
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.GCP_PROJECT }}
 
       - name: Configure Docker for Artifact Registry
-        run: |
-          gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # ------------------------------------------------------------------------
-      # Build & Push Container Image
-      # ------------------------------------------------------------------------
       - name: Build and Push Docker Container
         run: |
-          IMAGE_URI="${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}"
-          TAG_SHA="${IMAGE_URI}:${{ github.sha }}"
-          TAG_LATEST="${IMAGE_URI}:latest"
+          docker build -t asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest .
+          docker push asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest
 
-          echo "Building image: ${TAG_SHA}"
-          docker build \
-            -t "${TAG_SHA}" \
-            -t "${TAG_LATEST}" \
-            -f Dockerfile .
-
-          echo "Pushing images to Google Artifact Registry..."
-          docker push "${TAG_SHA}"
-          docker push "${TAG_LATEST}"
-
-      # ------------------------------------------------------------------------
-      # Deploy or Update Cloud Run Job
-      # ------------------------------------------------------------------------
-      - name: Deploy or Update Cloud Run Job
+      - name: Create or Update Cloud Run Job
         run: |
-          IMAGE_URI="${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          INGEST_LIMIT="${{ github.event.inputs.limit || '0' }}"
+          gcloud run jobs describe sc-rag-offline-job --region=asia-south1 > /dev/null 2>&1 && \
+          gcloud run jobs update sc-rag-offline-job \
+            --image=asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest \
+            --region=asia-south1 \
+            --project=sc-judgments-rag || \
+          gcloud run jobs create sc-rag-offline-job \
+            --image=asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest \
+            --region=asia-south1 \
+            --project=sc-judgments-rag \
+            --task-timeout=3600s \
+            --max-retries=2
 
-          echo "Deploying Cloud Run Job '${{ env.JOB_NAME }}' with image ${IMAGE_URI}..."
-          gcloud run jobs deploy "${{ env.JOB_NAME }}" \
-            --image="${IMAGE_URI}" \
-            --region="${{ env.GCP_REGION }}" \
-            --command="python" \
-            --args="offline_pipeline.py,--limit,${INGEST_LIMIT}" \
-            --set-env-vars="GCP_PROJECT=${{ env.GCP_PROJECT }},GCP_REGION=${{ env.GCP_REGION }},BUCKET_NAME=${{ env.BUCKET_NAME }},CLOUD_SQL_CONNECTION_NAME=${{ env.CLOUD_SQL_INSTANCE }}" \
-            --set-cloudsql-instances="${{ env.CLOUD_SQL_INSTANCE }}" \
-            --memory="4Gi" \
-            --cpu="2" \
-            --task-timeout="3600" \
-            --max-retries=1
-
-      # ------------------------------------------------------------------------
-      # Execute Cloud Run Job (Runs asynchronously or waits on completion)
-      # ------------------------------------------------------------------------
-      - name: Execute Cloud Run Ingestion Job
-        if: ${{ github.event_name == 'schedule' || github.event.inputs.execute_job == 'true' || github.event_name == 'push' }}
+      - name: Execute Cloud Run Job
         run: |
-          echo "Executing Cloud Run Job: ${{ env.JOB_NAME }} in ${{ env.GCP_REGION }}..."
-          gcloud run jobs execute "${{ env.JOB_NAME }}" \
-            --region="${{ env.GCP_REGION }}" \
-            --wait
-
-      - name: Execution Summary
-        if: always()
-        run: |
-          echo "### Ingestion Run Summary :gavel:" >> $GITHUB_STEP_SUMMARY
-          echo "- **GCP Project:** \`${{ env.GCP_PROJECT }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Region:** \`${{ env.GCP_REGION }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Artifact Registry Image:** \`${{ env.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Cloud Run Job:** \`${{ env.JOB_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **GCS Raw Bucket:** \`gs://${{ env.BUCKET_NAME }}/raw/\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **GCS Parsed Destination:** \`gs://${{ env.BUCKET_NAME }}/parsed/\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Trigger Event:** \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
-
+          gcloud run jobs execute sc-rag-offline-job --region=asia-south1 --wait
