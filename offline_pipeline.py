@@ -921,20 +921,37 @@ class OfflineIngestionPipeline:
         Filters out directory placeholder markers and non-PDF files.
         """
         if not self.bucket:
-            logger.error("GCS bucket client not initialized.")
+            logger.error(f"GCS bucket '{settings.BUCKET_NAME}' client not initialized.")
             return []
 
-        logger.info(f"Discovering PDF files recursively under gs://{settings.BUCKET_NAME}/{prefix} ...")
+        clean_prefix = prefix.strip()
+        if clean_prefix and not clean_prefix.endswith("/"):
+            clean_prefix += "/"
+
+        logger.info(f"Discovering PDF files recursively under gs://{settings.BUCKET_NAME}/{clean_prefix} ...")
         try:
-            all_blobs = list(self.bucket.list_blobs(prefix=prefix))
+            all_blobs = list(self.bucket.list_blobs(prefix=clean_prefix))
             pdf_blobs = [
                 b for b in all_blobs
                 if b.name.lower().endswith(".pdf") and not b.name.endswith("/")
             ]
-            logger.info(f"Discovered {len(pdf_blobs)} raw PDF blob(s) in GCS.")
+
+            if not pdf_blobs:
+                # Fallback check: check unslashed prefix or list available top-level prefixes
+                fallback_blobs = list(self.bucket.list_blobs(prefix=clean_prefix.rstrip("/")))
+                pdf_blobs = [
+                    b for b in fallback_blobs
+                    if b.name.lower().endswith(".pdf") and not b.name.endswith("/")
+                ]
+
+            logger.info(f"Discovered {len(pdf_blobs)} raw PDF blob(s) in gs://{settings.BUCKET_NAME}/{clean_prefix}")
+            for p in pdf_blobs[:10]:
+                logger.info(f"  -> Found raw PDF: {p.name} ({p.size} bytes)")
+            if len(pdf_blobs) > 10:
+                logger.info(f"  -> ... and {len(pdf_blobs) - 10} more PDF(s).")
             return pdf_blobs
         except Exception as e:
-            logger.error(f"Error discovering blobs in GCS: {e}")
+            logger.error(f"Error discovering blobs in gs://{settings.BUCKET_NAME}: {e}")
             return []
 
     def upload_parquet_dataset(
@@ -943,11 +960,11 @@ class OfflineIngestionPipeline:
         metadata: Dict[str, Any],
         parents: List[Dict[str, Any]],
         embeddings: List[List[float]],
-    ) -> str:
+    ) -> Dict[str, str]:
         """
         Serializes parsed document chunks, metadata, and embeddings to Parquet
-        and uploads directly to GCS under the 'parsed/' prefix.
-        Returns the destination GCS URI.
+        and uploads directly to GCS under 'parsed/' and 'chunks/' prefixes.
+        Returns a dict of destination GCS URIs.
         """
         rows = []
         card = metadata.get("case_card", {})
@@ -987,25 +1004,29 @@ class OfflineIngestionPipeline:
         df.to_parquet(parquet_buffer, engine="pyarrow", index=False)
         parquet_bytes = parquet_buffer.getvalue()
 
-        # Derive GCS parsed path: raw/.../*.pdf -> parsed/.../*.parquet
+        # Derive relative path from raw/.../*.pdf
         raw_prefix = settings.GCS_RAW_PREFIX
         if blob_name.startswith(raw_prefix):
             rel_path = blob_name[len(raw_prefix):]
         else:
-            rel_path = blob_name
+            rel_path = Path(blob_name).name
 
-        parsed_rel_path = re.sub(r"\.pdf$", ".parquet", rel_path, flags=re.IGNORECASE)
-        parsed_blob_name = f"{settings.GCS_PARQUET_PREFIX}{parsed_rel_path}"
+        stem = re.sub(r"\.pdf$", "", rel_path, flags=re.IGNORECASE)
+        parsed_blob_name = f"{settings.GCS_PARQUET_PREFIX}{stem}.parquet"
+        chunks_blob_name = f"{settings.GCS_CHUNKS_PREFIX}{stem}.parquet"
 
-        parsed_blob = self.bucket.blob(parsed_blob_name)
-        parsed_blob.upload_from_string(
-            parquet_bytes,
-            content_type="application/octet-stream"
-        )
+        # 1. Upload to GCS parsed/
+        p_blob = self.bucket.blob(parsed_blob_name)
+        p_blob.upload_from_string(parquet_bytes, content_type="application/octet-stream")
+        parsed_uri = f"gs://{settings.BUCKET_NAME}/{parsed_blob_name}"
 
-        gcs_parquet_uri = f"gs://{settings.BUCKET_NAME}/{parsed_blob_name}"
-        logger.info(f"Uploaded parsed Parquet dataset ({len(rows)} chunks) to {gcs_parquet_uri}")
-        return gcs_parquet_uri
+        # 2. Upload to GCS chunks/
+        c_blob = self.bucket.blob(chunks_blob_name)
+        c_blob.upload_from_string(parquet_bytes, content_type="application/octet-stream")
+        chunks_uri = f"gs://{settings.BUCKET_NAME}/{chunks_blob_name}"
+
+        logger.info(f"Uploaded Parquet feature-sets ({len(rows)} chunks) to {parsed_uri} & {chunks_uri}")
+        return {"parsed_uri": parsed_uri, "chunks_uri": chunks_uri}
 
     def process_blob(self, blob: storage.Blob) -> bool:
         """Processes a single PDF blob streamed in-memory from GCS with strong parsing."""
@@ -1134,6 +1155,31 @@ class OfflineIngestionPipeline:
             f"Batch processing completed: {success_count} succeeded, "
             f"{failed_count} skipped/failed out of {len(target_blobs)} total."
         )
+
+        # Write batch audit log to GCS logs/ folder (visible in Cloud Storage Console)
+        if self.bucket:
+            try:
+                run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                audit_payload = {
+                    "run_timestamp": datetime.utcnow().isoformat(),
+                    "bucket": settings.BUCKET_NAME,
+                    "prefix": prefix,
+                    "limit_requested": limit,
+                    "total_discovered": len(blobs),
+                    "total_processed": len(target_blobs),
+                    "success_count": success_count,
+                    "failed_count": failed_count,
+                    "processed_files": [b.name for b in target_blobs],
+                }
+                log_blob_name = f"{settings.GCS_LOGS_PREFIX}run_{run_ts}.json"
+                log_blob = self.bucket.blob(log_blob_name)
+                log_blob.upload_from_string(
+                    json.dumps(audit_payload, indent=2),
+                    content_type="application/json"
+                )
+                logger.info(f"Uploaded batch audit report to gs://{settings.BUCKET_NAME}/{log_blob_name}")
+            except Exception as log_err:
+                logger.warning(f"Could not write audit log to GCS: {log_err}")
 
 
 def init_database_schema(dsn: str, schema_file: Path):

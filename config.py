@@ -49,6 +49,18 @@ class Settings(BaseSettings):
         default="parsed/",
         description="GCS blob prefix for segmented Parquet document tables"
     )
+    GCS_CHUNKS_PREFIX: str = Field(
+        default="chunks/",
+        description="GCS blob prefix for fine-grained chunk embeddings tables"
+    )
+    GCS_EXPORTS_PREFIX: str = Field(
+        default="exports/",
+        description="GCS blob prefix for database analytical exports"
+    )
+    GCS_LOGS_PREFIX: str = Field(
+        default="logs/",
+        description="GCS blob prefix for batch ingestion execution audit logs"
+    )
 
     # Vertex AI Model Specifications
     GEMINI_MODEL: str = Field(
