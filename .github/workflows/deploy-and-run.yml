@@ -21,6 +21,7 @@ jobs:
         id: auth
         uses: google-github-actions/auth@v2
         with:
+          token_format: 'access_token'
           workload_identity_provider: ${{ secrets.WIF_PROVIDER || 'projects/315039048199/locations/global/workloadIdentityPools/github-pool/providers/github-provider' }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT || 'github-actions-deployer@sc-legal-rag-prod.iam.gserviceaccount.com' }}
 
@@ -28,7 +29,9 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+        run: |
+          gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+          gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin asia-south1-docker.pkg.dev
 
       - name: Build and Push Docker Container
         run: |
