@@ -12,6 +12,7 @@ permissions:
 jobs:
   deploy-and-run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -40,14 +41,29 @@ jobs:
           gcloud run jobs update sc-rag-offline-job \
             --image=asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest \
             --region=asia-south1 \
-            --project=sc-judgments-rag || \
+            --project=sc-judgments-rag \
+            --command="python" \
+            --args="offline_pipeline.py,--limit,22" \
+            --set-cloudsql-instances=sc-judgments-rag:asia-south1:sc-rag-db \
+            --set-env-vars=GCP_PROJECT=sc-judgments-rag,GCP_REGION=asia-south1,BUCKET_NAME=sc-judgments-rag-sc-rag,CLOUD_SQL_CONNECTION_NAME=sc-judgments-rag:asia-south1:sc-rag-db \
+            --memory=4Gi \
+            --cpu=2 \
+            --task-timeout=900s \
+            --max-retries=0 || \
           gcloud run jobs create sc-rag-offline-job \
             --image=asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest \
             --region=asia-south1 \
             --project=sc-judgments-rag \
-            --task-timeout=3600s \
-            --max-retries=2
+            --command="python" \
+            --args="offline_pipeline.py,--limit,22" \
+            --set-cloudsql-instances=sc-judgments-rag:asia-south1:sc-rag-db \
+            --set-env-vars=GCP_PROJECT=sc-judgments-rag,GCP_REGION=asia-south1,BUCKET_NAME=sc-judgments-rag-sc-rag,CLOUD_SQL_CONNECTION_NAME=sc-judgments-rag:asia-south1:sc-rag-db \
+            --memory=4Gi \
+            --cpu=2 \
+            --task-timeout=900s \
+            --max-retries=0
 
       - name: Execute Cloud Run Job
         run: |
+          echo "Executing Cloud Run batch job (timeout 15m, 0 retries)..."
           gcloud run jobs execute sc-rag-offline-job --region=asia-south1 --wait

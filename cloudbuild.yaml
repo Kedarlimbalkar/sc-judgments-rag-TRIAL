@@ -45,13 +45,13 @@ steps:
       - '--image=asia-south1-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/offline-pipeline:$SHORT_SHA'
       - '--region=${_REGION}'
       - '--command=python'
-      - '--args=offline_pipeline.py,--limit,0'
+      - '--args=offline_pipeline.py,--limit,22'
       - '--set-env-vars=GCP_PROJECT=$PROJECT_ID,GCP_REGION=${_REGION},BUCKET_NAME=${_BUCKET_NAME},CLOUD_SQL_CONNECTION_NAME=${_CLOUD_SQL_INSTANCE}'
       - '--set-cloudsql-instances=${_CLOUD_SQL_INSTANCE}'
       - '--memory=4Gi'
       - '--cpu=2'
-      - '--task-timeout=3600'
-      - '--max-retries=1'
+      - '--task-timeout=900'
+      - '--max-retries=0'
 
 images:
   - 'asia-south1-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/offline-pipeline:$SHORT_SHA'
@@ -67,4 +67,3 @@ substitutions:
 options:
   logging: CLOUD_LOGGING_ONLY
   machineType: 'E2_HIGHCPU_8'
-

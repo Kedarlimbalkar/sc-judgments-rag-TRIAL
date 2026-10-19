@@ -1,7 +1,7 @@
 # ==============================================================================
 # Supreme Court Judgments RAG - Cloud Run Container Definition
 # Base: Python 3.11 Slim
-# Target Port: 8080
+# Dual-Role: FastAPI Online Server OR Cloud Run Batch Ingestion Job
 # ==============================================================================
 
 FROM python:3.11-slim
@@ -35,9 +35,11 @@ COPY config.py .
 COPY schema.sql .
 COPY online_app.py .
 COPY offline_pipeline.py .
+COPY entrypoint.sh .
 
-# Assign ownership to the non-privileged user
-RUN chown -R appuser:appgroup ${APP_HOME}
+# Ensure entrypoint is executable and assign ownership to appuser
+RUN chmod +x entrypoint.sh && \
+    chown -R appuser:appgroup ${APP_HOME}
 
 # Switch to non-root execution
 USER appuser
@@ -49,6 +51,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:${PORT:-8080}/healthz || exit 1
 
-# Execute FastAPI via Uvicorn with dynamic Cloud Run PORT binding
-CMD ["sh", "-c", "exec uvicorn online_app:app --host 0.0.0.0 --port ${PORT:-8080} --workers 2"]
-
+# Smart Entrypoint: Automatically switches between Cloud Run Job and Cloud Run Service
+ENTRYPOINT ["./entrypoint.sh"]

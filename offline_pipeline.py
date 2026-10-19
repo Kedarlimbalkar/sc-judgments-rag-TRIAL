@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 Offline Ingestion Pipeline for Supreme Court Judgments (v2 Cloud Architecture).
-Dynamically streams raw judgment PDFs directly from Google Cloud Storage ('raw/'),
-zone-parses and segments judicial content, extracts legal metadata via Gemini 2.5 Flash,
-chunks hierarchically (parents ~1500 words, children ~350 words), embeds via text-embedding-004,
-uploads segmented Parquet datasets back to GCS ('parsed/'), and bulk-upserts into Cloud SQL / PostgreSQL.
+Features:
+- Strong In-Memory PDF Parsing: Full-document legibility scoring, page-level fault isolation,
+  and tail-order (disposition) verification for inconsistent or hybrid PDFs.
+- Direct Google Cloud Storage Streaming: Ingests raw PDFs directly from 'raw/' without disk caching.
+- Hierarchical Two-Tier Representation: Parent sections (~1500 words) and Child chunks (~350 words).
+- Cloud SQL Bulk Upsert: Idempotent transactional persistence with pgvector 768-dim embeddings.
+- GCS Parquet Archival: Serializes enriched document features directly to 'parsed/'.
 """
 
 import argparse
@@ -15,6 +18,7 @@ import logging
 import os
 import re
 import sys
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,6 +27,7 @@ try:
     import pymupdf as fitz
 except ImportError:
     import fitz
+
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
@@ -42,13 +47,18 @@ logger = logging.getLogger("offline_pipeline")
 
 
 # ==============================================================================
-# 1. In-Memory PDF Zone Parsing & Triage via PyMuPDF (fitz)
+# 1. Strong In-Memory PDF Parsing & Health-Audited Zone Extraction
 # ==============================================================================
 class SupremeCourtPDFParser:
     """
-    High-fidelity zone parser tailored for Indian Supreme Court judgments (SCR & digital).
-    Operates on in-memory bytes streamed from GCS. Separates headers, footers,
-    outer margin annotations, and extracts clean body text without disk caching.
+    Resilient coordinate-aware zone parser for Indian Supreme Court judgments.
+    Engineered to handle inconsistent PDFs:
+    - Scanned pages midway or after cover pages
+    - Corrupted font/stream blocks with page-level fault isolation
+    - Document legibility ratio auditing
+    - Concluding order (tail disposition) integrity validation
+    - Bounding-box zone extraction (headers, footers, outer margins)
+    - Unicode normalization and cross-line de-hyphenation
     """
 
     def __init__(
@@ -56,110 +66,201 @@ class SupremeCourtPDFParser:
         header_margin: float = settings.PDF_HEADER_MARGIN_PT,
         footer_margin: float = settings.PDF_FOOTER_MARGIN_PT,
         outer_margin: float = settings.PDF_OUTER_MARGIN_PT,
+        min_char_threshold: int = 40,
+        min_legibility_ratio: float = 0.40,
     ):
         self.header_margin = header_margin
         self.footer_margin = footer_margin
         self.outer_margin = outer_margin
+        self.min_char_threshold = min_char_threshold
+        self.min_legibility_ratio = min_legibility_ratio
 
-    def triage_pdf_bytes(self, pdf_bytes: bytes, blob_name: str) -> Tuple[bool, str, int]:
+    def parse_document_resilient(self, pdf_bytes: bytes, blob_name: str) -> Dict[str, Any]:
         """
-        Validates if PDF is readable and contains machine-extractable digital text.
-        Returns: (is_valid, reason, total_pages)
+        Executes a comprehensive health-audited parsing pass over the PDF bytes stream.
+        Returns a rich status payload with extraction diagnostics.
         """
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             total_pages = len(doc)
             if total_pages == 0:
                 doc.close()
-                return False, f"Blob {blob_name} has 0 pages", 0
-
-            # Sample first 3 pages or all if fewer
-            sample_pages = min(3, total_pages)
-            total_chars = sum(len(doc[i].get_text()) for i in range(sample_pages))
-            doc.close()
-
-            if total_chars < 80:
-                return (
-                    False,
-                    f"Insufficient text ({total_chars} chars across {sample_pages} pages); likely scanned image",
-                    total_pages
-                )
-
-            return True, "Valid digital PDF", total_pages
+                return {
+                    "can_ingest": False,
+                    "status": "FAILED_CORRUPT",
+                    "total_pages": 0,
+                    "reason": f"PDF stream '{blob_name}' contains 0 pages.",
+                    "pages": [],
+                    "complete_text": "",
+                }
         except Exception as e:
-            return False, f"Failed to parse PDF bytes: {str(e)}", 0
+            return {
+                "can_ingest": False,
+                "status": "FAILED_CORRUPT",
+                "total_pages": 0,
+                "reason": f"Failed to initialize PDF stream: {str(e)}",
+                "pages": [],
+                "complete_text": "",
+            }
 
-    def parse_document_bytes(self, pdf_bytes: bytes) -> Dict[str, Any]:
-        """
-        Parses PDF in memory: strips running headers and footers, captures page ranges,
-        and stitches normalized body text.
-        """
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        total_pages = len(doc)
+        valid_pages: List[int] = []
+        scanned_or_blank_pages: List[Dict[str, Any]] = []
+        corrupted_pages: List[Dict[str, Any]] = []
         pages_content: List[Dict[str, Any]] = []
         full_text_parts: List[str] = []
 
+        # Page-by-page fault-isolated extraction
         for page_idx in range(total_pages):
-            page = doc[page_idx]
-            rect = page.rect
-            width, height = rect.width, rect.height
+            page_num = page_idx + 1
+            try:
+                page = doc[page_idx]
+                rect = page.rect
+                width, height = rect.width, rect.height
 
-            # Extract text blocks: (x0, y0, x1, y1, text, block_no, block_type)
-            blocks = page.get_text("blocks")
-            body_blocks: List[str] = []
-            header_blocks: List[str] = []
-            footer_blocks: List[str] = []
-            margin_notes: List[str] = []
+                # Extract text blocks: (x0, y0, x1, y1, text, block_no, block_type)
+                blocks = page.get_text("blocks")
+                body_blocks: List[str] = []
+                header_blocks: List[str] = []
+                footer_blocks: List[str] = []
+                margin_notes: List[str] = []
 
-            for b in blocks:
-                # b[6] == 0 indicates text block
-                if b[6] != 0:
-                    continue
+                for b in blocks:
+                    # b[6] == 0 indicates text block
+                    if b[6] != 0:
+                        continue
 
-                x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
-                if not text:
-                    continue
+                    x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
+                    if not text:
+                        continue
 
-                # Zone: Running Header (SCR citation or case header)
-                if y1 <= self.header_margin:
-                    header_blocks.append(text)
-                # Zone: Running Footer (page number, digital signatures)
-                elif y0 >= (height - self.footer_margin):
-                    footer_blocks.append(text)
-                # Zone: Outer Margin (paragraph numbers, reporter headnote tags)
-                elif x1 <= self.outer_margin or x0 >= (width - self.outer_margin):
-                    margin_notes.append(text)
+                    # Zone: Running Header (Top 50pt)
+                    if y1 <= self.header_margin:
+                        header_blocks.append(text)
+                    # Zone: Running Footer (Bottom 50pt)
+                    elif y0 >= (height - self.footer_margin):
+                        footer_blocks.append(text)
+                    # Zone: Outer Margin (Outer 45pt)
+                    elif x1 <= self.outer_margin or x0 >= (width - self.outer_margin):
+                        margin_notes.append(text)
+                    else:
+                        # Zone: Main Judicial Opinion Body
+                        clean_text = self._clean_block_text(text)
+                        if clean_text:
+                            body_blocks.append(clean_text)
+
+                page_body = "\n\n".join(body_blocks)
+                char_count = len(page_body.strip())
+
+                if char_count < self.min_char_threshold:
+                    # Check for embedded images (scanned pages)
+                    img_count = len(page.get_images())
+                    page_type = "scanned" if img_count > 0 else "blank"
+                    scanned_or_blank_pages.append({
+                        "page_num": page_num,
+                        "type": page_type,
+                        "char_count": char_count,
+                    })
                 else:
-                    # Zone: Main Judicial Opinion Body
-                    clean_text = self._clean_block_text(text)
-                    if clean_text:
-                        body_blocks.append(clean_text)
+                    valid_pages.append(page_num)
+                    pages_content.append({
+                        "page_num": page_num,
+                        "header": " | ".join(header_blocks),
+                        "footer": " | ".join(footer_blocks),
+                        "margin_notes": margin_notes,
+                        "body": page_body,
+                    })
+                    full_text_parts.append(page_body)
 
-            page_body = "\n\n".join(body_blocks)
-            pages_content.append({
-                "page_num": page_idx + 1,
-                "header": " | ".join(header_blocks),
-                "footer": " | ".join(footer_blocks),
-                "margin_notes": margin_notes,
-                "body": page_body,
-            })
-            if page_body:
-                full_text_parts.append(page_body)
+            except Exception as page_err:
+                corrupted_pages.append({"page_num": page_num, "error": str(page_err)})
+                logger.warning(f"Corrupted or unreadable page {page_num} in {blob_name}: {page_err}")
 
         doc.close()
 
+        # ----------------------------------------------------------------------
+        # Document-Wide Legibility & Quality Health Audit
+        # ----------------------------------------------------------------------
+        valid_count = len(valid_pages)
+        legibility_ratio = valid_count / total_pages if total_pages > 0 else 0.0
+
+        # Check Concluding Order (Tail Disposition) Integrity
+        tail_pages = [total_pages - 1, total_pages] if total_pages >= 2 else [total_pages]
+        tail_missing = all(p not in valid_pages for p in tail_pages)
+
+        # Decision Rule 1: High Page Corruption Rate (> 15% of document)
+        if len(corrupted_pages) > max(2, int(total_pages * 0.15)):
+            corrupted_nums = [p["page_num"] for p in corrupted_pages]
+            return {
+                "can_ingest": False,
+                "status": "CORRUPTED",
+                "total_pages": total_pages,
+                "reason": f"File corrupted on {len(corrupted_pages)}/{total_pages} pages ({corrupted_nums[:10]}).",
+                "legibility_ratio": round(legibility_ratio, 2),
+                "pages": [],
+                "complete_text": "",
+            }
+
+        # Decision Rule 2: Low Legibility (Predominantly scanned without OCR)
+        if legibility_ratio < self.min_legibility_ratio or valid_count == 0:
+            scanned_count = len(scanned_or_blank_pages)
+            return {
+                "can_ingest": False,
+                "status": "NEEDS_OCR",
+                "total_pages": total_pages,
+                "reason": (
+                    f"Insufficient digital text ({valid_count}/{total_pages} readable pages, "
+                    f"{scanned_count} scanned/blank, legibility: {legibility_ratio:.1%}). Document requires OCR."
+                ),
+                "legibility_ratio": round(legibility_ratio, 2),
+                "pages": [],
+                "complete_text": "",
+            }
+
+        # Decision Rule 3: Missing Concluding Disposition (Final 2 pages blank or scanned)
+        if tail_missing and total_pages >= 4:
+            return {
+                "can_ingest": False,
+                "status": "INCOMPLETE_DISPOSITION",
+                "total_pages": total_pages,
+                "reason": "Final concluding pages containing the court's judgment order are blank/scanned. Incomplete judicial record.",
+                "legibility_ratio": round(legibility_ratio, 2),
+                "pages": [],
+                "complete_text": "",
+            }
+
+        # Decision Rule 4: Successful Extraction (Valid or Hybrid Document)
         complete_text = "\n\n".join(full_text_parts)
+        audit_summary = (
+            f"Successfully extracted {valid_count}/{total_pages} pages "
+            f"({legibility_ratio:.1%} legibility, {len(scanned_or_blank_pages)} omitted scanned/blank pages)."
+        )
+
         return {
+            "can_ingest": True,
+            "status": "COMPLETED",
             "total_pages": total_pages,
+            "valid_pages_count": valid_count,
+            "scanned_pages_count": len(scanned_or_blank_pages),
+            "corrupted_pages_count": len(corrupted_pages),
+            "legibility_ratio": round(legibility_ratio, 2),
             "pages": pages_content,
             "complete_text": complete_text,
+            "reason": audit_summary,
         }
 
     @staticmethod
     def _clean_block_text(text: str) -> str:
-        """Removes hyphenated line breaks and abnormal white-space artifacts."""
+        """
+        Normalizes Unicode characters, reconstructs hyphenated words broken
+        across line wraps, and collapses redundant whitespace.
+        """
+        # Normalize Unicode ligatures (e.g., fi, fl), smart quotes, non-breaking spaces
+        text = unicodedata.normalize("NFKD", text)
+        # De-hyphenate broken legal terms across lines (e.g. "constitu- \n tional" -> "constitutional")
         text = re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", text)
+        # Collapse multiple inline spaces and soft tabs
         text = re.sub(r"[ \t]+", " ", text)
+        # Clean abnormal multiple newlines while preserving paragraph breaks
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
@@ -258,12 +359,20 @@ JUDGMENT CONTENT:
     def _fallback_rule_extractor(text: str, filename: str) -> Dict[str, Any]:
         """Robust deterministic rule-based fallback when Vertex AI is inaccessible."""
         stem = Path(filename).stem
-        title_match = re.search(r"([A-Z][A-Za-z\s\.,]+)\s+(?:VERSUS|VS\.?|V\.)\s+([A-Z][A-Za-z\s\.,]+)", text[:3000], re.IGNORECASE)
+        title_match = re.search(
+            r"([A-Z][A-Za-z\s\.,]+)\s+(?:VERSUS|VS\.?|V\.)\s+([A-Z][A-Za-z\s\.,]+)",
+            text[:3000],
+            re.IGNORECASE
+        )
         petitioner = title_match.group(1).strip() if title_match else "Appellant / Petitioner"
         respondent = title_match.group(2).strip() if title_match else "Respondent / Union of India"
         title = f"{petitioner} v. {respondent}" if title_match else stem.replace("_", " ").title()
 
-        date_match = re.search(r"(?:dated|date of judgment|decided on)[:\s]+(\d{1,2}[\.\-\/]\d{1,2}[\.\-\/]\d{4}|\w+\s+\d{1,2},\s+\d{4})", text[:3000], re.IGNORECASE)
+        date_match = re.search(
+            r"(?:dated|date of judgment|decided on)[:\s]+(\d{1,2}[\.\-\/]\d{1,2}[\.\-\/]\d{4}|\w+\s+\d{1,2},\s+\d{4})",
+            text[:3000],
+            re.IGNORECASE
+        )
         judgment_date = None
         if date_match:
             try:
@@ -458,7 +567,7 @@ class HierarchicalChunker:
 class EmbeddingService:
     """
     Generates 768-dimensional embeddings for child chunks using text-embedding-004.
-    Performs batched requests (up to 250 texts per batch) for optimal throughput.
+    Performs batched requests (up to 200 texts per batch) for optimal throughput.
     """
 
     def __init__(self, project: str, region: str, model_name: str = settings.EMBEDDING_MODEL):
@@ -515,7 +624,7 @@ class EmbeddingService:
 # 5. Cloud SQL / PostgreSQL Bulk Upsert Pipeline
 # ==============================================================================
 class DatabaseLoader:
-    """Manages transactional bulk upserts into Cloud SQL / PostgreSQL."""
+    """Manages transactional bulk upserts and health status tracking into PostgreSQL."""
 
     def __init__(self, dsn: str):
         self.dsn = dsn
@@ -553,29 +662,31 @@ class DatabaseLoader:
             conn.commit()
         return ingest_id
 
-    def record_ingest_failure(self, filename: str, error_msg: str):
+    def record_ingest_failure(self, filename: str, error_msg: str, status: str = "FAILED"):
+        """Records diagnostic status (FAILED, NEEDS_OCR, CORRUPTED, INCOMPLETE_DISPOSITION)."""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     UPDATE ingest_status
-                    SET status = 'FAILED', error_message = %s, updated_at = NOW()
+                    SET status = %s, error_message = %s, updated_at = NOW()
                     WHERE source_file = %s;
                     """,
-                    (error_msg, filename)
+                    (status, error_msg, filename)
                 )
             conn.commit()
 
-    def record_ingest_complete(self, filename: str, total_pages: int):
+    def record_ingest_complete(self, filename: str, total_pages: int, audit_msg: Optional[str] = None):
+        """Records successful ingestion with page counts and diagnostic summary."""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     UPDATE ingest_status
-                    SET status = 'COMPLETED', total_pages = %s, completed_at = NOW(), updated_at = NOW()
+                    SET status = 'COMPLETED', total_pages = %s, error_message = %s, completed_at = NOW(), updated_at = NOW()
                     WHERE source_file = %s;
                     """,
-                    (total_pages, filename)
+                    (total_pages, audit_msg, filename)
                 )
             conn.commit()
 
@@ -814,13 +925,17 @@ class OfflineIngestionPipeline:
             return []
 
         logger.info(f"Discovering PDF files recursively under gs://{settings.BUCKET_NAME}/{prefix} ...")
-        all_blobs = list(self.bucket.list_blobs(prefix=prefix))
-        pdf_blobs = [
-            b for b in all_blobs
-            if b.name.lower().endswith(".pdf") and not b.name.endswith("/")
-        ]
-        logger.info(f"Discovered {len(pdf_blobs)} raw PDF blob(s) in GCS.")
-        return pdf_blobs
+        try:
+            all_blobs = list(self.bucket.list_blobs(prefix=prefix))
+            pdf_blobs = [
+                b for b in all_blobs
+                if b.name.lower().endswith(".pdf") and not b.name.endswith("/")
+            ]
+            logger.info(f"Discovered {len(pdf_blobs)} raw PDF blob(s) in GCS.")
+            return pdf_blobs
+        except Exception as e:
+            logger.error(f"Error discovering blobs in GCS: {e}")
+            return []
 
     def upload_parquet_dataset(
         self,
@@ -893,7 +1008,7 @@ class OfflineIngestionPipeline:
         return gcs_parquet_uri
 
     def process_blob(self, blob: storage.Blob) -> bool:
-        """Processes a single PDF blob streamed in-memory from GCS."""
+        """Processes a single PDF blob streamed in-memory from GCS with strong parsing."""
         logger.info(f"--- Processing GCS Blob: {blob.name} ({blob.size} bytes) ---")
         gcs_uri = f"gs://{settings.BUCKET_NAME}/{blob.name}"
 
@@ -918,18 +1033,22 @@ class OfflineIngestionPipeline:
             logger.error(f"DB error recording start for {blob.name}: {e}")
             return False
 
-        # Step 3: Triage & Zone Parse PDF
-        is_valid, triage_reason, total_pages = self.parser.triage_pdf_bytes(pdf_bytes, blob.name)
-        if not is_valid:
-            logger.warning(f"Skipping {blob.name}: {triage_reason}")
-            self.db.record_ingest_failure(blob.name, triage_reason)
+        # Step 3: Strong Parsing Pass (Health Audited & Fault Isolated)
+        parsed_res = self.parser.parse_document_resilient(pdf_bytes, blob.name)
+        if not parsed_res["can_ingest"]:
+            logger.warning(
+                f"Skipping {blob.name} [{parsed_res['status']}]: {parsed_res['reason']}"
+            )
+            self.db.record_ingest_failure(
+                filename=blob.name,
+                error_msg=parsed_res["reason"],
+                status=parsed_res["status"]
+            )
             return False
 
-        parsed_doc = self.parser.parse_document_bytes(pdf_bytes)
-        complete_text = parsed_doc["complete_text"]
-        if not complete_text.strip():
-            self.db.record_ingest_failure(blob.name, "Extracted empty body text")
-            return False
+        total_pages = parsed_res["total_pages"]
+        complete_text = parsed_res["complete_text"]
+        audit_note = parsed_res["reason"]
 
         # Step 4: Extract Judicial Metadata via Gemini 2.5 Flash
         logger.info(f"Extracting metadata & case card for {blob.name}...")
@@ -937,7 +1056,7 @@ class OfflineIngestionPipeline:
 
         # Step 5: Hierarchical Chunking (Parents ~1500 words, Children ~350 words)
         logger.info(f"Segmenting into parent-child hierarchy...")
-        parents = self.chunker.chunk_document(parsed_doc)
+        parents = self.chunker.chunk_document(parsed_res)
         total_children = sum(len(p["children"]) for p in parents)
         logger.info(f"Generated {len(parents)} parents and {total_children} child chunks.")
 
@@ -956,7 +1075,6 @@ class OfflineIngestionPipeline:
             )
         except Exception as e:
             logger.error(f"Failed to upload Parquet to GCS for {blob.name}: {e}")
-            # Non-fatal to SQL upsert, but logged
 
         # Step 8: Atomic Cloud SQL / PostgreSQL Bulk Upsert
         logger.info(f"Persisting {blob.name} into database...")
@@ -969,12 +1087,12 @@ class OfflineIngestionPipeline:
                 embeddings=embeddings,
                 total_pages=total_pages,
             )
-            self.db.record_ingest_complete(blob.name, total_pages)
-            logger.info(f"Successfully ingested and indexed {blob.name}")
+            self.db.record_ingest_complete(blob.name, total_pages, audit_note)
+            logger.info(f"Successfully ingested and indexed {blob.name} ({audit_note})")
             return True
         except Exception as e:
             logger.exception(f"Failed to persist {blob.name} into Cloud SQL: {e}")
-            self.db.record_ingest_failure(blob.name, str(e))
+            self.db.record_ingest_failure(blob.name, str(e), status="FAILED")
             return False
 
     def run(self, limit: Optional[int] = settings.DEFAULT_INGEST_LIMIT, prefix: str = settings.GCS_RAW_PREFIX):
@@ -999,11 +1117,23 @@ class OfflineIngestionPipeline:
             logger.info(f"Processing ALL {len(target_blobs)} discovered GCS blob(s) (unlimited mode)")
 
         success_count = 0
-        for b in target_blobs:
-            if self.process_blob(b):
-                success_count += 1
+        failed_count = 0
 
-        logger.info(f"Batch processing complete: {success_count}/{len(target_blobs)} succeeded.")
+        for idx, b in enumerate(target_blobs, 1):
+            logger.info(f"[{idx}/{len(target_blobs)}] Processing {b.name}...")
+            try:
+                if self.process_blob(b):
+                    success_count += 1
+                else:
+                    failed_count += 1
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Unexpected exception processing {b.name}: {e}")
+
+        logger.info(
+            f"Batch processing completed: {success_count} succeeded, "
+            f"{failed_count} skipped/failed out of {len(target_blobs)} total."
+        )
 
 
 def init_database_schema(dsn: str, schema_file: Path):
@@ -1044,7 +1174,6 @@ def main():
         schema_path = Path(__file__).parent / "schema.sql"
         init_database_schema(settings.DB_DSN, schema_path)
 
-    # If limit is 0 or negative, treat as None (process all blobs)
     effective_limit = args.limit if args.limit and args.limit > 0 else 0
 
     pipeline = OfflineIngestionPipeline()
