@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # Google Cloud Platform & Vertex AI
     # --------------------------------------------------------------------------
     GCP_PROJECT: str = Field(
-        default="sc-judgments-rag",
+        default="sc-legal-rag-prod",
         description="Google Cloud Platform project ID"
     )
     GCP_REGION: str = Field(
@@ -34,11 +34,11 @@ class Settings(BaseSettings):
 
     # Cloud Storage Bucket & Prefixes (v2 Architecture)
     BUCKET_NAME: str = Field(
-        default="sc-judgments-rag-sc-rag",
+        default="sc-legal-documents-raw",
         description="Google Cloud Storage bucket name for raw PDFs and parsed Parquet datasets"
     )
     GCS_BUCKET: str = Field(
-        default="sc-judgments-rag-sc-rag",
+        default="sc-legal-documents-raw",
         description="Alias for BUCKET_NAME"
     )
     GCS_RAW_PREFIX: str = Field(

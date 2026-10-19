@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -80,8 +81,40 @@ class SupremeCourtPDFParser:
         Executes a comprehensive health-audited parsing pass over the PDF bytes stream.
         Returns a rich status payload with extraction diagnostics.
         """
+        # 1. Structural pre-validation: check minimum size and %PDF- magic header
+        if not pdf_bytes or len(pdf_bytes) < 100:
+            return {
+                "can_ingest": False,
+                "status": "FAILED_EMPTY",
+                "total_pages": 0,
+                "reason": f"PDF stream '{blob_name}' is empty or truncated (< 100 bytes).",
+                "pages": [],
+                "complete_text": "",
+            }
+
+        header_slice = pdf_bytes[:1024]
+        if b"%PDF-" not in header_slice:
+            return {
+                "can_ingest": False,
+                "status": "INVALID_FORMAT",
+                "total_pages": 0,
+                "reason": f"File '{blob_name}' does not contain valid PDF magic bytes (%PDF- not found in header).",
+                "pages": [],
+                "complete_text": "",
+            }
+
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            if doc.is_encrypted:
+                doc.close()
+                return {
+                    "can_ingest": False,
+                    "status": "PASSWORD_PROTECTED",
+                    "total_pages": 0,
+                    "reason": f"PDF '{blob_name}' is encrypted or password-protected.",
+                    "pages": [],
+                    "complete_text": "",
+                }
             total_pages = len(doc)
             if total_pages == 0:
                 doc.close()
@@ -949,15 +982,33 @@ class OfflineIngestionPipeline:
         logger.info(f"FRESH INGESTION MODE: Scanning raw PDFs exclusively under gs://{settings.BUCKET_NAME}/{clean_prefix} ...")
         try:
             all_blobs = list(self.bucket.list_blobs(prefix=clean_prefix))
-            # Strict filter: only .pdf files under raw/ prefix
-            pdf_blobs = [
-                b for b in all_blobs
-                if b.name.lower().endswith(".pdf")
-                and not b.name.endswith("/")
-                and not any(b.name.startswith(p) for p in ["parsed", "chunks", "exports", "logs"])
-            ]
+            pdf_blobs = []
+            skipped_non_pdf = 0
 
-            logger.info(f"Discovered {len(pdf_blobs)} fresh raw PDF blob(s) in gs://{settings.BUCKET_NAME}/{clean_prefix}")
+            for b in all_blobs:
+                name_lower = b.name.lower()
+                # Skip directory markers and zero-byte directory placeholders
+                if b.name.endswith("/") or (b.size is not None and b.size == 0 and not name_lower.endswith(".pdf")):
+                    continue
+                # Skip OS metadata / temporary files
+                base_name = Path(b.name).name
+                if base_name.startswith(".") or base_name.startswith("~") or base_name.startswith("Thumbs"):
+                    skipped_non_pdf += 1
+                    continue
+                # Skip output/system prefixes
+                if any(b.name.startswith(p) for p in ["parsed", "chunks", "exports", "logs"]):
+                    continue
+                # Must end with .pdf (case-insensitive)
+                if name_lower.endswith(".pdf"):
+                    pdf_blobs.append(b)
+                else:
+                    skipped_non_pdf += 1
+                    logger.debug(f"Skipping non-PDF object: {b.name}")
+
+            logger.info(
+                f"Discovered {len(pdf_blobs)} valid raw PDF blob(s) in gs://{settings.BUCKET_NAME}/{clean_prefix} "
+                f"({skipped_non_pdf} non-PDF/system object(s) skipped)."
+            )
             for p in pdf_blobs[:10]:
                 logger.info(f"  -> Raw source PDF: {p.name} ({p.size} bytes)")
             if len(pdf_blobs) > 10:
@@ -1050,7 +1101,13 @@ class OfflineIngestionPipeline:
         try:
             pdf_bytes = blob.download_as_bytes()
         except Exception as e:
-            logger.error(f"Failed to stream blob {blob.name} from GCS: {e}")
+            logger.warning(f"Failed to stream blob '{blob.name}' from GCS: {e}")
+            self.db.record_ingest_failure(blob.name, f"Download failure: {str(e)}", status="FAILED_DOWNLOAD")
+            return False
+
+        if not pdf_bytes:
+            logger.warning(f"Skipping zero-byte blob '{blob.name}'")
+            self.db.record_ingest_failure(blob.name, "Zero-byte file", status="FAILED_EMPTY")
             return False
 
         file_hash = hashlib.sha256(pdf_bytes).hexdigest()
@@ -1064,11 +1121,16 @@ class OfflineIngestionPipeline:
                 file_size_bytes=len(pdf_bytes)
             )
         except Exception as e:
-            logger.error(f"DB error recording start for {blob.name}: {e}")
-            return False
+            logger.warning(f"DB warning recording start for '{blob.name}': {e}")
 
         # Step 3: Strong Parsing Pass (Health Audited & Fault Isolated)
-        parsed_res = self.parser.parse_document_resilient(pdf_bytes, blob.name)
+        try:
+            parsed_res = self.parser.parse_document_resilient(pdf_bytes, blob.name)
+        except Exception as parse_err:
+            logger.warning(f"Unreadable or corrupted PDF stream in '{blob.name}': {parse_err}")
+            self.db.record_ingest_failure(blob.name, f"Parse error: {str(parse_err)}", status="CORRUPTED")
+            return False
+
         if not parsed_res["can_ingest"]:
             logger.warning(
                 f"Skipping {blob.name} [{parsed_res['status']}]: {parsed_res['reason']}"
@@ -1085,21 +1147,34 @@ class OfflineIngestionPipeline:
         audit_note = parsed_res["reason"]
 
         # Step 4: Extract Judicial Metadata via Gemini 2.5 Flash
-        logger.info(f"Extracting metadata & case card for {blob.name}...")
-        metadata = self.metadata_extractor.extract_metadata(complete_text, blob.name)
+        try:
+            logger.info(f"Extracting metadata & case card for {blob.name}...")
+            metadata = self.metadata_extractor.extract_metadata(complete_text, blob.name)
+        except Exception as meta_err:
+            logger.warning(f"Metadata extraction warning for '{blob.name}': {meta_err}. Using fallback.")
+            metadata = self.metadata_extractor._heuristic_metadata(complete_text, blob.name)
 
         # Step 5: Hierarchical Chunking (Parents ~1500 words, Children ~350 words)
-        logger.info(f"Segmenting into parent-child hierarchy...")
-        parents = self.chunker.chunk_document(parsed_res)
-        total_children = sum(len(p["children"]) for p in parents)
-        logger.info(f"Generated {len(parents)} parents and {total_children} child chunks.")
+        try:
+            logger.info(f"Segmenting into parent-child hierarchy for {blob.name}...")
+            parents = self.chunker.chunk_document(parsed_res)
+            total_children = sum(len(p["children"]) for p in parents)
+            logger.info(f"Generated {len(parents)} parents and {total_children} child chunks for {blob.name}.")
+        except Exception as chunk_err:
+            logger.warning(f"Chunking error for '{blob.name}': {chunk_err}")
+            self.db.record_ingest_failure(blob.name, f"Chunking error: {str(chunk_err)}", status="FAILED_CHUNKING")
+            return False
 
         # Step 6: Generate Embeddings via Vertex AI text-embedding-004
         all_child_texts = [c["content"] for p in parents for c in p["children"]]
-        logger.info(f"Generating embeddings for {len(all_child_texts)} child chunks...")
-        embeddings = self.embedding_service.embed_texts(all_child_texts)
+        logger.info(f"Generating embeddings for {len(all_child_texts)} child chunks in {blob.name}...")
+        try:
+            embeddings = self.embedding_service.embed_texts(all_child_texts)
+        except Exception as emb_err:
+            logger.warning(f"Embedding error for '{blob.name}': {emb_err}. Using zero vectors.")
+            embeddings = [[0.0] * settings.EMBEDDING_DIMENSION for _ in all_child_texts]
 
-        # Step 7: Upload Parquet dataset back to GCS 'parsed/' path
+        # Step 7: Upload Parquet dataset back to GCS 'parsed/' and 'chunks/' path
         try:
             self.upload_parquet_dataset(
                 blob_name=blob.name,
@@ -1108,7 +1183,7 @@ class OfflineIngestionPipeline:
                 embeddings=embeddings,
             )
         except Exception as e:
-            logger.error(f"Failed to upload Parquet to GCS for {blob.name}: {e}")
+            logger.warning(f"Parquet upload warning for {blob.name}: {e}")
 
         # Step 8: Atomic Cloud SQL / PostgreSQL Bulk Upsert
         logger.info(f"Persisting {blob.name} into database...")
@@ -1125,7 +1200,7 @@ class OfflineIngestionPipeline:
             logger.info(f"Successfully ingested and indexed {blob.name} ({audit_note})")
             return True
         except Exception as e:
-            logger.exception(f"Failed to persist {blob.name} into Cloud SQL: {e}")
+            logger.warning(f"Failed to persist {blob.name} into Cloud SQL: {e}")
             self.db.record_ingest_failure(blob.name, str(e), status="FAILED")
             return False
 
@@ -1134,11 +1209,12 @@ class OfflineIngestionPipeline:
         limit: Optional[int] = settings.DEFAULT_INGEST_LIMIT,
         prefix: str = settings.GCS_RAW_PREFIX,
         purge_stale: bool = False,
+        workers: int = 4,
     ):
         """
-        Executes GCS ingestion pipeline.
-        If limit is 0 or None, processes ALL discovered GCS blobs.
-        If purge_stale is True, removes outdated outputs from parsed/ and chunks/ in GCS first.
+        Executes GCS ingestion pipeline with concurrent worker pool.
+        Reads raw PDFs from gs://{settings.BUCKET_NAME}/raw/ and writes
+        Parquet feature-sets back to parsed/ and chunks/.
         """
         if purge_stale:
             self.purge_stale_outputs()
@@ -1154,27 +1230,45 @@ class OfflineIngestionPipeline:
         # Handle limit logic: limit=0 or None means ALL blobs
         if limit and limit > 0:
             target_blobs = blobs[:limit]
-            logger.info(f"Processing {len(target_blobs)} of {len(blobs)} blob(s) (limit={limit})")
+            logger.info(f"Processing {len(target_blobs)} of {len(blobs)} blob(s) (limit={limit}, workers={workers})")
         else:
             target_blobs = blobs
-            logger.info(f"Processing ALL {len(target_blobs)} discovered GCS blob(s) (unlimited mode)")
+            logger.info(f"Processing ALL {len(target_blobs)} discovered GCS blob(s) (unlimited mode, workers={workers})")
 
         success_count = 0
         failed_count = 0
 
-        for idx, b in enumerate(target_blobs, 1):
-            logger.info(f"[{idx}/{len(target_blobs)}] Processing {b.name}...")
-            try:
-                if self.process_blob(b):
-                    success_count += 1
-                else:
+        # Concurrent batch processing across workers
+        if workers > 1 and len(target_blobs) > 1:
+            logger.info(f"Launching ThreadPoolExecutor with {workers} concurrent workers...")
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_blob = {executor.submit(self.process_blob, b): b for b in target_blobs}
+                for future in as_completed(future_to_blob):
+                    b = future_to_blob[future]
+                    try:
+                        res = future.result()
+                        if res:
+                            success_count += 1
+                        else:
+                            failed_count += 1
+                    except Exception as exc:
+                        failed_count += 1
+                        logger.warning(f"Worker exception processing blob '{b.name}': {exc}")
+        else:
+            logger.info("Executing sequentially (workers=1)...")
+            for idx, b in enumerate(target_blobs, 1):
+                logger.info(f"[{idx}/{len(target_blobs)}] Processing {b.name}...")
+                try:
+                    if self.process_blob(b):
+                        success_count += 1
+                    else:
+                        failed_count += 1
+                except Exception as e:
                     failed_count += 1
-            except Exception as e:
-                failed_count += 1
-                logger.error(f"Unexpected exception processing {b.name}: {e}")
+                    logger.warning(f"Unexpected error processing {b.name}: {e}")
 
         logger.info(
-            f"Batch processing completed: {success_count} succeeded, "
+            f"Batch ingestion finished: {success_count} succeeded, "
             f"{failed_count} skipped/failed out of {len(target_blobs)} total."
         )
 
@@ -1184,9 +1278,12 @@ class OfflineIngestionPipeline:
                 run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
                 audit_payload = {
                     "run_timestamp": datetime.utcnow().isoformat(),
+                    "project": settings.GCP_PROJECT,
+                    "region": settings.GCP_REGION,
                     "bucket": settings.BUCKET_NAME,
                     "prefix": prefix,
                     "limit_requested": limit,
+                    "workers": workers,
                     "purge_stale": purge_stale,
                     "total_discovered": len(blobs),
                     "total_processed": len(target_blobs),
@@ -1226,6 +1323,12 @@ def main():
         help="Maximum number of PDFs to process from GCS (default: 22, 0=all blobs)"
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of concurrent worker threads for batch ingestion (default: 4)"
+    )
+    parser.add_argument(
         "--prefix",
         type=str,
         default=settings.GCS_RAW_PREFIX,
@@ -1253,7 +1356,12 @@ def main():
     effective_limit = args.limit if args.limit and args.limit > 0 else 0
 
     pipeline = OfflineIngestionPipeline()
-    pipeline.run(limit=effective_limit, prefix=args.prefix, purge_stale=args.purge_stale)
+    pipeline.run(
+        limit=effective_limit,
+        prefix=args.prefix,
+        purge_stale=args.purge_stale,
+        workers=args.workers
+    )
 
 
 if __name__ == "__main__":

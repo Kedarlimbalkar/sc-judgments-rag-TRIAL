@@ -21,8 +21,8 @@ jobs:
         id: auth
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: 'projects/315039048199/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
-          service_account: 'github-actions-deployer@sc-judgments-rag.iam.gserviceaccount.com'
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER || 'projects/315039048199/locations/global/workloadIdentityPools/github-pool/providers/github-provider' }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT || 'github-actions-deployer@sc-legal-rag-prod.iam.gserviceaccount.com' }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
@@ -32,32 +32,32 @@ jobs:
 
       - name: Build and Push Docker Container
         run: |
-          docker build -t asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest .
-          docker push asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest
+          docker build -t asia-south1-docker.pkg.dev/sc-legal-rag-prod/rag-docker-repo/offline-pipeline:latest .
+          docker push asia-south1-docker.pkg.dev/sc-legal-rag-prod/rag-docker-repo/offline-pipeline:latest
 
       - name: Create or Update Cloud Run Job
         run: |
-          gcloud run jobs describe sc-rag-offline-job --region=asia-south1 > /dev/null 2>&1 && \
-          gcloud run jobs update sc-rag-offline-job \
-            --image=asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest \
+          gcloud run jobs describe sc-rag-pipeline-job --region=asia-south1 > /dev/null 2>&1 && \
+          gcloud run jobs update sc-rag-pipeline-job \
+            --image=asia-south1-docker.pkg.dev/sc-legal-rag-prod/rag-docker-repo/offline-pipeline:latest \
             --region=asia-south1 \
-            --project=sc-judgments-rag \
+            --project=sc-legal-rag-prod \
             --command="python" \
-            --args="offline_pipeline.py,--limit,22" \
-            --set-cloudsql-instances=sc-judgments-rag:asia-south1:sc-rag-db \
-            --set-env-vars=GCP_PROJECT=sc-judgments-rag,GCP_REGION=asia-south1,BUCKET_NAME=sc-judgments-rag-sc-rag,CLOUD_SQL_CONNECTION_NAME=sc-judgments-rag:asia-south1:sc-rag-db \
+            --args="offline_pipeline.py,--limit,22,--workers,4" \
+            --set-cloudsql-instances=sc-legal-rag-prod:asia-south1:sc-rag-db \
+            --set-env-vars=GCP_PROJECT=sc-legal-rag-prod,GCP_REGION=asia-south1,BUCKET_NAME=sc-legal-documents-raw,CLOUD_SQL_CONNECTION_NAME=sc-legal-rag-prod:asia-south1:sc-rag-db \
             --memory=4Gi \
             --cpu=2 \
             --task-timeout=900s \
             --max-retries=0 || \
-          gcloud run jobs create sc-rag-offline-job \
-            --image=asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest \
+          gcloud run jobs create sc-rag-pipeline-job \
+            --image=asia-south1-docker.pkg.dev/sc-legal-rag-prod/rag-docker-repo/offline-pipeline:latest \
             --region=asia-south1 \
-            --project=sc-judgments-rag \
+            --project=sc-legal-rag-prod \
             --command="python" \
-            --args="offline_pipeline.py,--limit,22" \
-            --set-cloudsql-instances=sc-judgments-rag:asia-south1:sc-rag-db \
-            --set-env-vars=GCP_PROJECT=sc-judgments-rag,GCP_REGION=asia-south1,BUCKET_NAME=sc-judgments-rag-sc-rag,CLOUD_SQL_CONNECTION_NAME=sc-judgments-rag:asia-south1:sc-rag-db \
+            --args="offline_pipeline.py,--limit,22,--workers,4" \
+            --set-cloudsql-instances=sc-legal-rag-prod:asia-south1:sc-rag-db \
+            --set-env-vars=GCP_PROJECT=sc-legal-rag-prod,GCP_REGION=asia-south1,BUCKET_NAME=sc-legal-documents-raw,CLOUD_SQL_CONNECTION_NAME=sc-legal-rag-prod:asia-south1:sc-rag-db \
             --memory=4Gi \
             --cpu=2 \
             --task-timeout=900s \
@@ -65,21 +65,21 @@ jobs:
 
       - name: Execute Cloud Run Job
         run: |
-          echo "Executing Cloud Run batch job (timeout 15m, 0 retries)..."
-          gcloud run jobs execute sc-rag-offline-job --region=asia-south1 --wait
+          echo "Executing Cloud Run batch job 'sc-rag-pipeline-job' (timeout 15m, 0 retries)..."
+          gcloud run jobs execute sc-rag-pipeline-job --region=asia-south1 --wait
 
       - name: Deploy Production Chatbot Web Service
         run: |
           echo "Deploying production Supreme Court RAG Chatbot Service..."
           gcloud run deploy sc-rag-chatbot \
-            --image=asia-south1-docker.pkg.dev/sc-judgments-rag/rag-repo/offline-pipeline:latest \
+            --image=asia-south1-docker.pkg.dev/sc-legal-rag-prod/rag-docker-repo/offline-pipeline:latest \
             --region=asia-south1 \
-            --project=sc-judgments-rag \
+            --project=sc-legal-rag-prod \
             --platform=managed \
             --allow-unauthenticated \
             --port=8080 \
-            --set-cloudsql-instances=sc-judgments-rag:asia-south1:sc-rag-db \
-            --set-env-vars=GCP_PROJECT=sc-judgments-rag,GCP_REGION=asia-south1,BUCKET_NAME=sc-judgments-rag-sc-rag,CLOUD_SQL_CONNECTION_NAME=sc-judgments-rag:asia-south1:sc-rag-db \
+            --set-cloudsql-instances=sc-legal-rag-prod:asia-south1:sc-rag-db \
+            --set-env-vars=GCP_PROJECT=sc-legal-rag-prod,GCP_REGION=asia-south1,BUCKET_NAME=sc-legal-documents-raw,CLOUD_SQL_CONNECTION_NAME=sc-legal-rag-prod:asia-south1:sc-rag-db \
             --memory=2Gi \
             --cpu=1 \
             --min-instances=0 \

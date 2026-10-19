@@ -59,10 +59,10 @@ images:
 
 substitutions:
   _REGION: 'asia-south1'
-  _REPOSITORY: 'rag-repo'
-  _JOB_NAME: 'sc-rag-offline-job'
-  _BUCKET_NAME: 'sc-judgments-rag-sc-rag'
-  _CLOUD_SQL_INSTANCE: 'sc-judgments-rag:asia-south1:sc-rag-db'
+  _REPOSITORY: 'rag-docker-repo'
+  _JOB_NAME: 'sc-rag-pipeline-job'
+  _BUCKET_NAME: 'sc-legal-documents-raw'
+  _CLOUD_SQL_INSTANCE: 'sc-legal-rag-prod:asia-south1:sc-rag-db'
 
 options:
   logging: CLOUD_LOGGING_ONLY
