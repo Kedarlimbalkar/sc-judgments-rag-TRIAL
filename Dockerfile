@@ -10,7 +10,10 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8080 \
-    APP_HOME=/app
+    APP_HOME=/app \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_SERVER_ENABLE_CORS=false \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
 # Install minimal OS dependencies for network health checks and database runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -35,6 +38,7 @@ COPY config.py .
 COPY schema.sql .
 COPY online_app.py .
 COPY offline_pipeline.py .
+COPY app.py .
 COPY entrypoint.sh .
 COPY static/ ./static/
 
@@ -50,7 +54,7 @@ EXPOSE 8080
 
 # Health check probe for orchestrators
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8080}/healthz || exit 1
+    CMD curl -f http://localhost:${PORT:-8080}/_stcore/health || curl -f http://localhost:${PORT:-8080}/healthz || exit 1
 
-# Smart Entrypoint: Automatically switches between Cloud Run Job and Cloud Run Service
-ENTRYPOINT ["./entrypoint.sh"]
+# Execute Streamlit Gemini-style Chat UI with Cloud Run PORT binding
+CMD streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0

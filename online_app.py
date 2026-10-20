@@ -872,3 +872,11 @@ async def service_info():
         "model_embeddings": settings.EMBEDDING_MODEL,
     }
 
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("online_app:app", host="0.0.0.0", port=port)
+
+

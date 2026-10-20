@@ -13,7 +13,7 @@ if [ $# -gt 0 ]; then
     exec "$@"
 fi
 
-# Otherwise, default to running the FastAPI online serving application
-echo "[Entrypoint] Launching Supreme Court RAG FastAPI server on port ${PORT:-8080}..."
-exec uvicorn online_app:app --host 0.0.0.0 --port "${PORT:-8080}" --workers 2
+# Otherwise, default to running the Streamlit web application
+echo "[Entrypoint] Launching Supreme Court RAG Streamlit app on port ${PORT:-8080}..."
+exec streamlit run app.py --server.port="${PORT:-8080}" --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false
 

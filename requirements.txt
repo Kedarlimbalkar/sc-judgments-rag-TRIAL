@@ -17,6 +17,9 @@ uvicorn[standard]>=0.28.0
 pydantic>=2.6.4
 pydantic-settings>=2.2.1
 
+# Streamlit Gemini Chat UI
+streamlit>=1.32.0
+
 # Environment & Utilities
 python-dotenv>=1.0.1
 
