@@ -17,48 +17,142 @@ The system addresses the unique structural, linguistic, and citation complexitie
 
 ---
 
-## 2. Complete System Architecture
+## 2. Comprehensive System Architectures
 
-The following diagram illustrates the complete, production-hardened end-to-end architecture across continuous integration, serverless batch ingestion, dual-mode storage, and the Gemini-style streaming chat interface:
+The Supreme Court Judgments RAG Engine is architected across three distinct system views: **Overall Platform Architecture**, **Offline Batch Ingestion Pipeline Architecture**, and **Online Serving & Gemini RAG Architecture**.
+
+---
+
+### 2.1 Overall System Architecture
+The end-to-end cloud platform view illustrates the complete integration spanning keyless CI/CD (GitHub Actions + WIF), Cloud Run container orchestration, dual-mode storage (Cloud SQL PostgreSQL + GCS Parquet Lake), and Gemini 2.5 Flash legal reasoning.
 
 ```mermaid
 flowchart TD
-    subgraph CI_CD["1. Keyless CI/CD & Deployment (GitHub Actions)"]
-        GHA["GitHub Actions (deploy-and-run.yml)"] -->|OIDC Token| WIF["Workload Identity Federation (WIF)"]
-        WIF -->|OAuth2 Access Token| GAR["Google Artifact Registry (rag-docker-repo)"]
-        GHA -->|Build & Push Docker Image| GAR
-        GAR -->|Deploy Container| CR_JOB["Cloud Run Job: sc-rag-pipeline-job"]
-        GAR -->|Deploy Web Service| CR_SVC["Cloud Run Service: sc-rag-chatbot"]
+    subgraph CI_CD["1. Keyless CI/CD & Deployment Layer (GitHub Actions)"]
+        DEV["Developer Push to main"] --> GHA["GitHub Actions (deploy-and-run.yml)"]
+        GHA -->|OIDC Token Exchange| WIF["Workload Identity Federation (WIF)"]
+        WIF -->|Temporary GCP Access Token| GAR["Google Artifact Registry (rag-docker-repo)"]
+        GHA -->|Build & Push Multi-Stage Container| GAR
+        GAR -->|Deploy Batch Container| CR_JOB["Cloud Run Job: sc-rag-pipeline-job"]
+        GAR -->|Deploy Web Container| CR_SVC["Cloud Run Service: sc-rag-chatbot"]
     end
 
-    subgraph INGESTION["2. Scalable Batch Ingestion Pipeline (offline_pipeline.py)"]
-        GCS_RAW[("GCS Bucket: sc-legal-documents-raw/raw/ (22 Year Partitions)")] -->|Dynamic Prefix Scanner| BFS["discover_year_partitions (1950-2026)"]
-        BFS -->|Batch Blobs & Progress Tracker| WORKERS["ThreadPoolExecutor (workers=4)"]
-        WORKERS -->|Stream PDF Bytes| PDF_PARSE["SupremeCourtPDFParser (PyMuPDF)"]
-        PDF_PARSE -->|Zone Coordinate Extraction| ZONING["Header/Footer/Margin Stripping"]
-        ZONING -->|Legibility & Tail-Order Triage| TRIAGE{"Quality Audit"}
-        TRIAGE -->|Valid Digital Text| LLM_META["Gemini 2.5 Flash: Metadata & Case Card Extraction"]
-        TRIAGE -->|Corrupted / Scanned| DB_FAIL["Log Ingest Failure (CORRUPTED / NEEDS_OCR)"]
-        LLM_META --> CHUNK["HierarchicalChunker (Parents ~1500w, Children ~350w)"]
-        CHUNK --> EMBED["Vertex AI: text-embedding-004 (768-d Vectors)"]
-        EMBED --> PQ_OUT[("GCS Parquet Lake: parsed/ & chunks/ (year=YYYY)")]
-        EMBED --> DB_LOAD["DatabaseLoader (ThreadedConnectionPool & execute_values)"]
+    subgraph OFFLINE["2. Offline Batch Ingestion Subsystem (offline_pipeline.py)"]
+        GCS_RAW[("Cloud Storage: raw/ (5,965 PDFs, 22 Years)")] --> CR_JOB
+        CR_JOB -->|Dynamic BFS Partition Scanner| SCAN["22 Year Partitions (1950-1960, 2016-2026)"]
+        SCAN -->|PyMuPDF Zoning & Triage Audit| PARSER["Resilient Document Parser & Chunker"]
+        PARSER -->|Batch Embeddings| EMBED_V["Vertex AI: text-embedding-004"]
     end
 
-    subgraph STORAGE["3. Dual-Mode Storage Architecture"]
-        DB_LOAD -.->|Fail-Safe Bulk Upsert| CSQL[("Cloud SQL PostgreSQL 15+ (pgvector, pg_trgm, FTS)")]
-        PQ_OUT --> GCS_PARQUET[("GCS Parquet Feature-Store (229+ Files, Hive Partitioned)")]
+    subgraph STORAGE["3. Dual-Mode Storage & Feature Store Layer"]
+        EMBED_V -->|Hive-Partitioned Upload| GCS_LAKE[("GCS Parquet Lake: parsed/ & chunks/ (year=YYYY)")]
+        EMBED_V -->|ThreadedConnectionPool Bulk Upsert| CSQL[("Cloud SQL PostgreSQL 15+ (pgvector & FTS)")]
     end
 
-    subgraph SERVING["4. Online Serving & Gemini RAG Architecture (app.py & online_app.py)"]
-        USER(["User / Legal Researcher"]) <-->|Free-Form Prompt & Streamed Tokens| UI["Streamlit Gemini-Style UI (app.py on 0.0.0.0:$PORT)"]
-        UI -->|Arbitrary Query| RETRIEVER["RetrievalEngine (Dynamic Hybrid RRF)"]
-        RETRIEVER -->|Check DB Pool| CSQL
-        RETRIEVER -->|In-Memory / FAISS Fallback| FAISS_STORE["ParquetVectorStore (FAISS IndexFlatIP + Lexical Fusion)"]
-        GCS_PARQUET -.->|Lazy Load & Cache| FAISS_STORE
-        RETRIEVER -->|Top 8-10 Context Passages| GATE["CitationVerificationGate (Open-Ended Legal Expert)"]
-        GATE -->|Strict Grounding System Prompt| GEMINI["Vertex AI Gemini 2.5 Flash"]
-        GEMINI -->|Token Streaming via st.write_stream| UI
+    subgraph ONLINE["4. Online Serving & Legal Reasoning Subsystem (app.py)"]
+        USER(["Advocate / Legal Researcher"]) <-->|Free-Form Queries & Real-Time Tokens| CR_SVC
+        CR_SVC -->|Hybrid Dense & Lexical Search| RETRIEVER["Dynamic Hybrid Retriever (Top 8-10 Passages)"]
+        RETRIEVER -.->|Primary Vector Search| CSQL
+        RETRIEVER -.->|Resilient In-Memory Fallback| GCS_LAKE
+        RETRIEVER -->|Strict Legal Grounding Prompt| GEMINI["Vertex AI Gemini 2.5 Flash"]
+        GEMINI -->|Token Streaming via st.write_stream| CR_SVC
+    end
+```
+
+---
+
+### 2.2 Offline Batch Ingestion Pipeline Architecture
+The offline ingestion architecture details the multi-stage batch processing engine inside `offline_pipeline.py`. It showcases the BFS partition discovery, PyMuPDF coordinate-aware zoning with explicit C-heap deallocation, quality triage auditing, Gemini metadata extraction, hierarchical chunking, and dual-mode persistence.
+
+```mermaid
+flowchart TD
+    subgraph DISCOVERY["Phase 1: Dynamic Discovery & Progress Tracking"]
+        GCS_IN[("GCS Bucket: sc-legal-documents-raw/raw/")] -->|List Common Prefixes| BFS["discover_year_partitions (BFS Dynamic Scan)"]
+        BFS -->|Discovered 22 Partitions| YEARS["Partitions: year=1950..1960, year=2016..2026"]
+        YEARS -->|Filter Corrupted & Zero-Byte Blobs| BLOBS["5,965 PDFs Queued for Ingestion"]
+        BLOBS -->|Batch Blobs & Track State| TRACKER["ProgressTracker (Docs/sec, Completed %, ETA every 50 files)"]
+    end
+
+    subgraph EXTRACTION["Phase 2: Streaming Ingestion & Quality Triage"]
+        TRACKER -->|Submit to ThreadPoolExecutor| WORKERS["Concurrent Workers (ThreadPoolExecutor workers=4)"]
+        WORKERS -->|Stream PDF Bytes into RAM| FITZ["PyMuPDF (fitz.open stream=pdf_bytes)"]
+        FITZ -->|Bounding-Box Zone Extraction| ZONING["Header & Footer Stripping (top/bottom 45pt, margins 36pt)"]
+        ZONING -->|Memory Deallocation| MEM["Explicit Heap Dealloc (del page, del pdf_bytes, gc.collect)"]
+        MEM --> TRIAGE{"Triage Quality Audit"}
+        TRIAGE -->|< 40% Readable Density| FLAG_OCR["Flag as NEEDS_OCR (Safe Skip LLM & DB)"]
+        TRIAGE -->|Corrupted / Unreadable| FLAG_ERR["Catch Exception: CORRUPTED_PDF (Safe Skip)"]
+        TRIAGE -->|Valid Digital Text| DISP{"Disposition Check"}
+        DISP -->|Missing Final Orders| FLAG_INC["Flag INCOMPLETE_DISPOSITION"]
+        DISP -->|Complete Judicial Record| SEMANTIC["Valid Document Passed to Semantic Layer"]
+    end
+
+    subgraph SEMANTIC_CHUNK["Phase 3: LLM Parsing & Hierarchical Chunking"]
+        SEMANTIC --> LLM_META["Vertex AI Gemini 2.5 Flash (Metadata & Case Cards)"]
+        LLM_META -->|Extract: Petitioner, Respondent, Coram, Citations, Ratio| CARD["Structured Case Card Metadata"]
+        SEMANTIC --> HIER_CHUNK["Hierarchical Chunker"]
+        HIER_CHUNK -->|Macro Sections ~1500 words| PARENTS["Parent Chunks (Full Judicial Discourse)"]
+        HIER_CHUNK -->|Micro Passages ~350 words, 10% overlap| CHILDREN["Child Chunks (Granular Legal Retrieval)"]
+        CHILDREN --> EMBED_API["Vertex AI text-embedding-004 API"]
+        EMBED_API -->|768-Dimensional Dense Vectors| VECTORS["Embedded Legal Chunks with Page References"]
+    end
+
+    subgraph DUAL_STORE["Phase 4: Dual-Mode Persistence & Feature Lake"]
+        VECTORS --> PARQUET_WRITER["PyArrow Parquet Serializer"]
+        PARQUET_WRITER -->|Hive-Partitioned Lake Upload| GCS_PARQUET[("GCS: gs://sc-legal-documents-raw/chunks/year=YYYY/")]
+        VECTORS --> DB_LOADER["DatabaseLoader (ThreadedConnectionPool 1-10 Conns)"]
+        DB_LOADER -->|Bulk execute_values Upsert| DB_EXEC["Cloud SQL PostgreSQL (judgments & judgment_chunks)"]
+        DB_EXEC -.->|Socket Offline / Network Exception| DB_SAFE["Defensive Fail-Safe Log & Continue"]
+    end
+```
+
+---
+
+### 2.3 Online Serving & Gemini RAG Architecture
+The online serving architecture illustrates the query-time pipeline inside `app.py` and `online_app.py`. It details the Gemini-style user experience, arbitrary free-form query processing, dual-mode hybrid retrieval (Cloud SQL pgvector + in-memory FAISS ParquetVectorStore), parent context expansion, citation verification gating, and token-by-token streaming.
+
+```mermaid
+flowchart TD
+    subgraph CLIENT["Phase 1: Web Interface & Free-Form Input"]
+        USER(["User (Advocate / Researcher / Citizen)"]) -->|Free-Form Legal Query (e.g. Shreekantiah Ramayya Munipalli)| UI["Streamlit UI (app.py)"]
+        UI -->|Port 8080 0.0.0.0 binding guarded by st.runtime.exists| RUNTIME["Streamlit Execution Engine"]
+        RUNTIME -->|Raw Query String (Zero Keyword Pre-filters)| ROUTER["Dynamic Query Handler"]
+    end
+
+    subgraph RETRIEVAL["Phase 2: Dynamic Dual-Mode Hybrid Retrieval"]
+        ROUTER --> QUERY_EMBED["Vertex AI text-embedding-004 (768-d Query Vector)"]
+        ROUTER --> DB_PROBE{"Cloud SQL Connection Check"}
+        
+        DB_PROBE -->|DB Socket Available| PG_SEARCH["Cloud SQL pgvector Search"]
+        PG_SEARCH -->|Cosine <=> Vector Search| PG_VEC["Top 20 Dense Vector Candidates"]
+        ROUTER -->|PostgreSQL Full-Text Search ts_rank| PG_LEX["Top 20 Keyword / BM25 Candidates"]
+        PG_VEC & PG_LEX --> RRF["Reciprocal Rank Fusion (RRF Algorithm)"]
+
+        DB_PROBE -->|DB Offline or Socket Failed| FAISS_SEARCH["ParquetVectorStore (In-Memory Engine)"]
+        GCS_PQ[("GCS Parquet Feature Store (year=YYYY)")] -.->|Cached Lazy Download| FAISS_STORE["In-Memory Arrow / Parquet Table"]
+        FAISS_STORE --> FAISS_INDEX["FAISS IndexFlatIP (Normalized Dot-Product)"]
+        QUERY_EMBED --> FAISS_INDEX
+        FAISS_INDEX -->|0.6 Weight Dense Cosine Sim| DENSE_CAND["Dense Vector Scores"]
+        ROUTER -->|0.4 Weight Token Inverted Index| LEX_CAND["Lexical Overlap Scores"]
+        DENSE_CAND & LEX_CAND --> SCORE_FUSION["Hybrid Score Fusion (0.6 * Dense + 0.4 * Lexical)"]
+
+        RRF --> SELECT_TOP["Select Top 8-10 Most Relevant Legal Chunks"]
+        SCORE_FUSION --> SELECT_TOP
+    end
+
+    subgraph EXPANSION_GATE["Phase 3: Context Assembly & Verification Gate"]
+        SELECT_TOP --> PARENT_EXP["Parent Chunk Context Expansion (Window ~1500 words)"]
+        PARENT_EXP --> CONTEXT_BLOCK["Rich Grounding Context Block with Citations & Case Names"]
+        CONTEXT_BLOCK --> GATE["CitationVerificationGate (Grounding Assertion)"]
+        GATE --> PROMPT_BUILD["Inject Open-Ended Supreme Court Legal Prompt"]
+        PROMPT_BUILD -->|Context Passages + User Query| GEMINI_CALL["Vertex AI Gemini 2.5 Flash API"]
+    end
+
+    subgraph STREAMING["Phase 4: Real-Time Streaming & Citation Display"]
+        GEMINI_CALL -->|Streaming Tokens (generate_content stream=True)| STREAM["Token-by-Token Generator (stream_synthesize)"]
+        STREAM -->|st.write_stream Real-Time Markdown Output| UI
+        STREAM --> METRICS["Compute Hallucination Risk & Retrieval Latency"]
+        METRICS --> ACCORDION["Collapsible Citation Inspector (Case, Year, Page, Similarity Score)"]
+        ACCORDION --> UI
     end
 ```
 
