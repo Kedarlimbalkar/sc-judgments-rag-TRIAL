@@ -3,9 +3,10 @@ PyMuPDF>=1.24.0
 pandas>=2.2.0
 pyarrow>=15.0.0
 
-# Database & pgvector
+# Database, pgvector & FAISS Vector Search
 psycopg2-binary>=2.9.9
 pgvector>=0.2.5
+faiss-cpu>=1.7.4
 
 # Google Cloud Platform & Vertex AI
 google-cloud-storage>=2.14.0

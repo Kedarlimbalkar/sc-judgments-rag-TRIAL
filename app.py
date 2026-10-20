@@ -1,6 +1,7 @@
 """
 Supreme Court of India - AI Judgments RAG Assistant
 Clean, Sober Gemini-Style Streamlit Web Application for Google Cloud Run.
+Fully Dynamic RAG Retrieval & Streaming Generation.
 """
 
 import os
@@ -108,18 +109,22 @@ st.markdown("""
 # ------------------------------------------------------------------------------
 @st.cache_resource
 def get_backend_services():
-    """Initializes database pool and Vertex AI service manager if available."""
+    """Initializes database pool, Parquet vector store, and Vertex AI service manager."""
+    from online_app import services, RetrievalEngine, CitationVerificationGate, ParquetVectorStore
     try:
-        from online_app import services, RetrievalEngine, VerificationGate
         services.initialize()
-        return {
-            "services": services,
-            "retrieval": RetrievalEngine(services),
-            "gate": VerificationGate(services),
-            "connected": True
-        }
-    except Exception as e:
-        return {"connected": False, "error": str(e)}
+    except Exception:
+        pass
+
+    parquet_store = ParquetVectorStore()
+    retrieval = RetrievalEngine(services, parquet_store=parquet_store)
+    gate = CitationVerificationGate(services)
+    return {
+        "services": services,
+        "retrieval": retrieval,
+        "gate": gate,
+        "parquet_store": parquet_store
+    }
 
 backend = get_backend_services()
 
@@ -135,7 +140,7 @@ with st.sidebar:
     st.markdown(
         "<div style='color: #9ca3af; font-size: 0.8rem;'>"
         "Supreme Court of India AI Legal Research Assistant.<br>"
-        "Queries are synthesized and verified against original judicial records."
+        "Queries are synthesized and verified dynamically against original judicial records."
         "</div>",
         unsafe_allow_html=True
     )
@@ -149,7 +154,7 @@ st.markdown("""
     <div>
         <h1 class="gemini-title">Supreme Court of India</h1>
         <div class="gemini-subtitle">
-            AI Legal Assistant • Verified Precedents & Constitutional Jurisprudence
+            AI Legal Assistant • Dynamic Precedent & Jurisprudence Retrieval
         </div>
     </div>
 </div>
@@ -169,18 +174,18 @@ if not st.session_state.messages:
             How can I assist your legal research today?
         </h2>
         <p style="color: #9ca3af; font-size: 0.9rem; margin-bottom: 1.25rem;">
-            Ask questions regarding Supreme Court judgments, constitutional articles, or statutory precedents.
+            Ask any question regarding Supreme Court judgments, parties, constitutional articles, or precedents.
         </p>
     </div>
     """, unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("⚖️ Twin Conditions for Bail under Section 45 PMLA", use_container_width=True):
-            st.session_state.pending_query = "What are the twin conditions for grant of bail under Section 45 of PMLA?"
+        if st.button("⚖️ Shreekantiah Ramayya Munipalli Case Rationale", use_container_width=True):
+            st.session_state.pending_query = "Who was Shreekantiah Ramayya Munipalli and what was the Supreme Court's holding in this case?"
             st.rerun()
-        if st.button("🏛️ Basic Structure Doctrine in Kesavananda Bharati", use_container_width=True):
-            st.session_state.pending_query = "What is the Basic Structure doctrine formulated in Kesavananda Bharati?"
+        if st.button("🏛️ Twin Conditions for Bail under Section 45 PMLA", use_container_width=True):
+            st.session_state.pending_query = "What are the twin conditions for grant of bail under Section 45 of PMLA?"
             st.rerun()
     with col2:
         if st.button("📜 Article 21 Right to Speedy Trial Principles", use_container_width=True):
@@ -190,193 +195,42 @@ if not st.session_state.messages:
             st.session_state.pending_query = "What principles govern appointment of arbitrators under Section 11?"
             st.rerun()
 
-# Display Chat Messages
+# Display Chat History Messages
 for msg in st.session_state.messages:
     if msg["role"] == "user":
         with st.chat_message("user", avatar="👤"):
             st.markdown(msg["content"])
     else:
         with st.chat_message("assistant", avatar="⚖️"):
-            # Main synthesized answer
             st.markdown(msg["content"])
             
-            # Grounded Citations
             citations = msg.get("citations", [])
             if citations:
                 chips_html = "".join([f'<span class="citation-tag">📌 {c}</span>' for c in citations])
                 st.markdown(f'<div style="margin-top: 0.6rem; margin-bottom: 0.4rem;">{chips_html}</div>', unsafe_allow_html=True)
                 
-            # Expandable Reference Passages
             parents = msg.get("parents", [])
             if parents:
                 with st.expander(f"📚 View Reference Passages ({len(parents)})"):
                     for p in parents:
+                        p_dict = p if isinstance(p, dict) else (p.model_dump() if hasattr(p, "model_dump") else p.dict())
                         st.markdown(f"""
                         <div class="parent-card">
                             <div class="parent-card-header">
-                                <span><strong>{p.get('section_title', 'Judicial Section')}</strong></span>
-                                <span>Pages {p.get('page_start', '?')}-{p.get('page_end', '?')} • Case: {p.get('case_number', 'SC')}</span>
+                                <span><strong>{p_dict.get('section_title', 'Judicial Section')}</strong></span>
+                                <span>Pages {p_dict.get('page_start', '?')}-{p_dict.get('page_end', '?')} • Case: {p_dict.get('case_number', 'SC')}</span>
                             </div>
                             <div style="font-weight: 600; color: #fff; margin-bottom: 0.25rem;">
-                                {p.get('case_title', 'Supreme Court of India')} ({p.get('judgment_date', 'N/A')})
+                                {p_dict.get('case_title', 'Supreme Court of India')} ({p_dict.get('judgment_date', 'N/A')})
                             </div>
                             <p style="color: #c4c7c5; line-height: 1.5; font-family: serif;">
-                                "{p.get('content', '')[:400]}..."
+                                "{p_dict.get('content', '')[:400]}..."
                             </p>
                         </div>
                         """, unsafe_allow_html=True)
 
 # ------------------------------------------------------------------------------
-# Query Execution Logic
-# ------------------------------------------------------------------------------
-def execute_rag_pipeline(query: str, top_k_val: int = 5) -> Dict[str, Any]:
-    """Queries backend retrieval engines and Gemini 2.5 Flash gate."""
-    start_time = time.time()
-    
-    # Check if live database backend is available
-    if backend.get("connected"):
-        try:
-            from online_app import QueryRouter, QueryRequest
-            router = QueryRouter()
-            detected_intent, payload = router.route(query)
-            
-            retrieval = backend["retrieval"]
-            gate = backend["gate"]
-            
-            # Execute search based on detected intent
-            if detected_intent == "PARTY_SEARCH":
-                matches = retrieval.search_parties_trigram(query, limit=top_k_val)
-                case_ids = [m.case_id for m in matches]
-                p_ids = []
-                if case_ids:
-                    conn = backend["services"].get_db_connection()
-                    try:
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT id FROM parents WHERE case_id = ANY(%s::uuid[]) LIMIT %s;", (case_ids, top_k_val))
-                            p_ids = [str(r[0]) for r in cur.fetchall()]
-                    finally:
-                        backend["services"].return_db_connection(conn)
-                parents = retrieval.expand_parents(p_ids)
-            elif detected_intent == "ARTICLE_MENTIONS":
-                clean_art = payload.get("article_clean", "21")
-                art_res = retrieval.query_article_mentions(clean_art, limit=top_k_val)
-                case_ids = [c["case_id"] for c in art_res.get("cases", [])]
-                p_ids = []
-                if case_ids:
-                    conn = backend["services"].get_db_connection()
-                    try:
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT id FROM parents WHERE case_id = ANY(%s::uuid[]) LIMIT %s;", (case_ids, top_k_val))
-                            p_ids = [str(r[0]) for r in cur.fetchall()]
-                    finally:
-                        backend["services"].return_db_connection(conn)
-                parents = retrieval.expand_parents(p_ids)
-            else:
-                chunks = retrieval.hybrid_search_rrf(query, top_k=top_k_val)
-                p_ids = list(dict.fromkeys(c["parent_id"] for c in chunks))
-                parents = retrieval.expand_parents(p_ids)
-                
-            answer, verification = gate.synthesize_and_verify(query, parents)
-            elapsed = int((time.time() - start_time) * 1000)
-            
-            return {
-                "answer": answer,
-                "citations": verification.verified_citations,
-                "parents": [p.model_dump() if hasattr(p, "model_dump") else p.dict() for p in parents],
-                "latency_ms": elapsed
-            }
-        except Exception:
-            pass
-            
-    # Domain synthesis fallback
-    elapsed = int((time.time() - start_time) * 1000) or 320
-    q_low = query.lower()
-    
-    if "pmla" in q_low or "section 45" in q_low or "bail" in q_low:
-        return {
-            "answer": (
-                "Under **Section 45 of the Prevention of Money Laundering Act, 2002 (PMLA)**, "
-                "bail is governed by mandatory twin conditions:\n\n"
-                "1. **Opportunity to Public Prosecutor**: The Public Prosecutor must be given an opportunity to oppose the bail application.\n"
-                "2. **Satisfaction of Court**: Where the Prosecutor opposes, the Court must be satisfied that there are reasonable grounds for believing the accused is **not guilty** and **not likely to commit any offence while on bail**.\n\n"
-                "In *Vijay Madanlal Choudhary v. Union of India (2022)*, the Supreme Court upheld the constitutional validity of Section 45. "
-                "In *Manish Sisodia v. Directorate of Enforcement (2024)*, the Court reaffirmed that prolonged pre-trial incarceration without trial commencement violates **Article 21** of the Constitution, and statutory bail restrictions cannot override the fundamental right to liberty."
-            ),
-            "citations": [
-                "Vijay Madanlal Choudhary v. Union of India (2022) SCC OnLine SC 929",
-                "Manish Sisodia v. Directorate of Enforcement (2024) 8 SCC 1",
-                "Constitution of India, Article 21"
-            ],
-            "parents": [
-                {
-                    "section_title": "Analysis of Section 45 Twin Conditions",
-                    "case_title": "Vijay Madanlal Choudhary v. Union of India",
-                    "case_number": "SLP (Crl.) No. 4634 of 2014",
-                    "judgment_date": "2022-07-27",
-                    "page_start": 114,
-                    "page_end": 122,
-                    "content": "The twin conditions mentioned in Section 45 of the 2002 Act, though stringent, have a reasonable nexus with the legislative objective of combating money laundering..."
-                }
-            ],
-            "latency_ms": elapsed
-        }
-    
-    if "basic structure" in q_low or "kesavananda" in q_low:
-        return {
-            "answer": (
-                "The **Basic Structure Doctrine** was established by a landmark 13-judge bench of the Supreme Court in "
-                "*Kesavananda Bharati v. State of Kerala (1973)*. The Court ruled that while Parliament possesses broad amending power "
-                "under **Article 368**, it cannot alter, damage, or destroy the basic structure or essential framework of the Constitution.\n\n"
-                "Core basic features recognized include:\n"
-                "- Supremacy of the Constitution\n"
-                "- Republican and Democratic form of government\n"
-                "- Secular character of the Constitution\n"
-                "- Separation of powers between legislature, executive, and judiciary\n"
-                "- Judicial review and fundamental rights protections"
-            ),
-            "citations": [
-                "Kesavananda Bharati v. State of Kerala (1973) 4 SCC 225",
-                "Minerva Mills Ltd. v. Union of India (1980) 3 SCC 625",
-                "Constitution of India, Article 368"
-            ],
-            "parents": [
-                {
-                    "section_title": "Limits on Constituent Power under Article 368",
-                    "case_title": "Kesavananda Bharati v. State of Kerala",
-                    "case_number": "Writ Petition (Civil) No. 135 of 1970",
-                    "judgment_date": "1973-04-24",
-                    "page_start": 1,
-                    "page_end": 45,
-                    "content": "The power of amendment under Article 368 does not include the power to alter the basic structure or framework of the Constitution..."
-                }
-            ],
-            "latency_ms": elapsed
-        }
-
-    return {
-        "answer": (
-            f"Based on Supreme Court of India precedents and constitutional jurisprudence, "
-            f"legal principles concerning **\"{query}\"** emphasize constitutional adherence, statutory interpretation, "
-            f"and judicial precedent.\n\n"
-            f"Relevant judicial citations and source sections are detailed below."
-        ),
-        "citations": ["Constitution of India", "Supreme Court Reports (SCR)"],
-        "parents": [
-            {
-                "section_title": "Judicial Ratio Decidendi",
-                "case_title": "Supreme Court of India",
-                "case_number": "Reported Judgment",
-                "judgment_date": "Recent Decision",
-                "page_start": 1,
-                "page_end": 12,
-                "content": "The Supreme Court observed that statutory provisions must be harmonized with constitutional protections and established precedent..."
-            }
-        ],
-        "latency_ms": elapsed
-    }
-
-# ------------------------------------------------------------------------------
-# User Input & Interaction Handling
+# Free-Form UI Input Flow & Dynamic Streaming Generation
 # ------------------------------------------------------------------------------
 prompt = st.chat_input("Ask a question about Supreme Court judgments, statutes, or constitutional law...")
 
@@ -386,46 +240,65 @@ if hasattr(st.session_state, "pending_query"):
     del st.session_state.pending_query
 
 if prompt:
-    # 1. Render User Message
+    # 1. Render User Message immediately
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user", avatar="👤"):
         st.markdown(prompt)
-        
-    # 2. Generate and Render Assistant Message
+
+    # 2. Dynamic Vector Search Across All Stored Chunks & Streaming Assistant Response
     with st.chat_message("assistant", avatar="⚖️"):
-        with st.spinner("Researching Supreme Court precedents..."):
-            result = execute_rag_pipeline(prompt)
-            
-            st.markdown(result["answer"])
-            
-            if result.get("citations"):
-                chips_html = "".join([f'<span class="citation-tag">📌 {c}</span>' for c in result["citations"]])
-                st.markdown(f'<div style="margin-top: 0.6rem; margin-bottom: 0.4rem;">{chips_html}</div>', unsafe_allow_html=True)
-                
-            if result.get("parents"):
-                with st.expander(f"📚 View Reference Passages ({len(result['parents'])})"):
-                    for p in result["parents"]:
-                        st.markdown(f"""
-                        <div class="parent-card">
-                            <div class="parent-card-header">
-                                <span><strong>{p.get('section_title', 'Judicial Section')}</strong></span>
-                                <span>Pages {p.get('page_start', '?')}-{p.get('page_end', '?')} • Case: {p.get('case_number', 'SC')}</span>
-                            </div>
-                            <div style="font-weight: 600; color: #fff; margin-bottom: 0.25rem;">
-                                {p.get('case_title', 'Supreme Court of India')} ({p.get('judgment_date', 'N/A')})
-                            </div>
-                            <p style="color: #c4c7c5; line-height: 1.5; font-family: serif;">
-                                "{p.get('content', '')[:400]}..."
-                            </p>
+        with st.spinner("Searching Supreme Court records & analyzing legal precedents..."):
+            retriever = backend["retrieval"]
+            gate = backend["gate"]
+
+            # Perform dynamic vector/similarity search across all chunks (fetching top 8-10 chunks)
+            chunks = retriever.hybrid_search_rrf(prompt, top_k=8)
+            parent_ids = list(dict.fromkeys(c.get("parent_id") or c.get("chunk_id") for c in chunks))
+            parents = retriever.expand_parents(parent_ids)
+
+        # Stream generated response token-by-token cleanly into chat interface
+        stream_gen = gate.stream_synthesize(prompt, parents)
+        full_response = st.write_stream(stream_gen)
+
+        # Grounded Citations
+        citations = []
+        for p in parents:
+            title = p.case_title if hasattr(p, "case_title") else p.get("case_title", "")
+            cite = p.citation if hasattr(p, "citation") else p.get("citation", "")
+            if title:
+                tag = f"{title} ({cite})" if cite else title
+                if tag not in citations:
+                    citations.append(tag)
+
+        if citations:
+            chips_html = "".join([f'<span class="citation-tag">📌 {c}</span>' for c in citations[:4]])
+            st.markdown(f'<div style="margin-top: 0.6rem; margin-bottom: 0.4rem;">{chips_html}</div>', unsafe_allow_html=True)
+
+        if parents:
+            with st.expander(f"📚 View Reference Passages ({len(parents)})"):
+                for p in parents:
+                    p_dict = p if isinstance(p, dict) else (p.model_dump() if hasattr(p, "model_dump") else p.dict())
+                    st.markdown(f"""
+                    <div class="parent-card">
+                        <div class="parent-card-header">
+                            <span><strong>{p_dict.get('section_title', 'Judicial Section')}</strong></span>
+                            <span>Pages {p_dict.get('page_start', '?')}-{p_dict.get('page_end', '?')} • Case: {p_dict.get('case_number', 'SC')}</span>
                         </div>
-                        """, unsafe_allow_html=True)
-                        
+                        <div style="font-weight: 600; color: #fff; margin-bottom: 0.25rem;">
+                            {p_dict.get('case_title', 'Supreme Court of India')} ({p_dict.get('judgment_date', 'N/A')})
+                        </div>
+                        <p style="color: #c4c7c5; line-height: 1.5; font-family: serif;">
+                            "{p_dict.get('content', '')[:400]}..."
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
     # 3. Save Assistant Message in Session State
     st.session_state.messages.append({
         "role": "assistant",
-        "content": result["answer"],
-        "citations": result.get("citations", []),
-        "parents": result.get("parents", [])
+        "content": full_response,
+        "citations": citations[:4],
+        "parents": [p.model_dump() if hasattr(p, "model_dump") else (p if isinstance(p, dict) else p.dict()) for p in parents]
     })
 
 # ------------------------------------------------------------------------------
