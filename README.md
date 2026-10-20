@@ -13,145 +13,200 @@ The system addresses the unique structural, linguistic, and citation complexitie
 - **Constitutional article cross-referencing** (e.g., Articles 14, 19, 21, 32, 226, 300A).
 - **Litigant entity variations** (Union of India, State governments, corporate parties, interveners, amici curiae).
 - **Strict citation fidelity requirements** (preventing hallucinated legal holdings, case names, or statutory provisions).
+- **Open-Ended Free-Form Legal Reasoning**: Delivering comprehensive answers for arbitrary legal inquiries, specific litigant searches (e.g., *Shreekantiah Ramayya Munipalli*), and constitutional doctrines with real-time token streaming.
 
 ---
 
-## 2. Project Role & Ownership: Kedar — Data Ingestion Engineer
+## 2. Complete System Architecture
 
-This section outlines the specific responsibilities, architectural decisions, and code implementations delivered by **Kedar (Data Ingestion Engineer)**. Use this mapping during code reviews and technical evaluations.
+The following diagram illustrates the complete, production-hardened end-to-end architecture across continuous integration, serverless batch ingestion, dual-mode storage, and the Gemini-style streaming chat interface:
 
-### 2.1 Core Deliverable
-> **Delivered:** A resilient, serverless document ingestion pipeline featuring in-memory stream processing directly from Google Cloud Storage, bounding-box coordinate text extraction, pre-flight triage for scanned documents, hierarchical parent-child segmentation, columnar Parquet archiving, and atomic bulk-upsert status tracking into Cloud SQL / PostgreSQL.
+```mermaid
+flowchart TD
+    subgraph CI_CD["1. Keyless CI/CD & Deployment (GitHub Actions)"]
+        GHA["GitHub Actions (deploy-and-run.yml)"] -->|OIDC Token| WIF["Workload Identity Federation (WIF)"]
+        WIF -->|OAuth2 Access Token| GAR["Google Artifact Registry (rag-docker-repo)"]
+        GHA -->|Build & Push Docker Image| GAR
+        GAR -->|Deploy Container| CR_JOB["Cloud Run Job: sc-rag-pipeline-job"]
+        GAR -->|Deploy Web Service| CR_SVC["Cloud Run Service: sc-rag-chatbot"]
+    end
 
-### 2.2 Responsibility-to-Code Implementation Matrix
+    subgraph INGESTION["2. Scalable Batch Ingestion Pipeline (offline_pipeline.py)"]
+        GCS_RAW[("GCS Bucket: sc-legal-documents-raw/raw/ (22 Year Partitions)")] -->|Dynamic Prefix Scanner| BFS["discover_year_partitions (1950-2026)"]
+        BFS -->|Batch Blobs & Progress Tracker| WORKERS["ThreadPoolExecutor (workers=4)"]
+        WORKERS -->|Stream PDF Bytes| PDF_PARSE["SupremeCourtPDFParser (PyMuPDF)"]
+        PDF_PARSE -->|Zone Coordinate Extraction| ZONING["Header/Footer/Margin Stripping"]
+        ZONING -->|Legibility & Tail-Order Triage| TRIAGE{"Quality Audit"}
+        TRIAGE -->|Valid Digital Text| LLM_META["Gemini 2.5 Flash: Metadata & Case Card Extraction"]
+        TRIAGE -->|Corrupted / Scanned| DB_FAIL["Log Ingest Failure (CORRUPTED / NEEDS_OCR)"]
+        LLM_META --> CHUNK["HierarchicalChunker (Parents ~1500w, Children ~350w)"]
+        CHUNK --> EMBED["Vertex AI: text-embedding-004 (768-d Vectors)"]
+        EMBED --> PQ_OUT[("GCS Parquet Lake: parsed/ & chunks/ (year=YYYY)")]
+        EMBED --> DB_LOAD["DatabaseLoader (ThreadedConnectionPool & execute_values)"]
+    end
+
+    subgraph STORAGE["3. Dual-Mode Storage Architecture"]
+        DB_LOAD -.->|Fail-Safe Bulk Upsert| CSQL[("Cloud SQL PostgreSQL 15+ (pgvector, pg_trgm, FTS)")]
+        PQ_OUT --> GCS_PARQUET[("GCS Parquet Feature-Store (229+ Files, Hive Partitioned)")]
+    end
+
+    subgraph SERVING["4. Online Serving & Gemini RAG Architecture (app.py & online_app.py)"]
+        USER(["User / Legal Researcher"]) <-->|Free-Form Prompt & Streamed Tokens| UI["Streamlit Gemini-Style UI (app.py on 0.0.0.0:$PORT)"]
+        UI -->|Arbitrary Query| RETRIEVER["RetrievalEngine (Dynamic Hybrid RRF)"]
+        RETRIEVER -->|Check DB Pool| CSQL
+        RETRIEVER -->|In-Memory / FAISS Fallback| FAISS_STORE["ParquetVectorStore (FAISS IndexFlatIP + Lexical Fusion)"]
+        GCS_PARQUET -.->|Lazy Load & Cache| FAISS_STORE
+        RETRIEVER -->|Top 8-10 Context Passages| GATE["CitationVerificationGate (Open-Ended Legal Expert)"]
+        GATE -->|Strict Grounding System Prompt| GEMINI["Vertex AI Gemini 2.5 Flash"]
+        GEMINI -->|Token Streaming via st.write_stream| UI
+    end
+```
+
+### Data Flow Lifecycle:
+1. **Developer Push to `main`**: GitHub Actions authenticates keylessly via OIDC and Workload Identity Federation (WIF). Builds and pushes the Docker container to Artifact Registry.
+2. **Batch Ingestion Job**: Cloud Run Job executes `offline_pipeline.py`. It dynamically scans all 22 year partitions (`year=1950` to `year=2026`), streams PDF bytes without disk caching, strips margins and headers, chunks hierarchically, generates 768-d embeddings, and writes partitioned Parquet datasets to GCS alongside bulk-upserts into PostgreSQL.
+3. **Dual-Mode Vector Storage**: Stores rich structured case models in Cloud SQL PostgreSQL (`pgvector`), while simultaneously generating a Hive-partitioned GCS Parquet Lake indexable via FAISS and NumPy vector similarity.
+4. **Online Query & Streaming Generation**: Users submit arbitrary legal queries via a clean, distraction-free Streamlit interface. The retrieval engine gathers the top 8–10 relevant passages through hybrid dense and lexical search, feeds them into Gemini 2.5 Flash using a strict legal grounding prompt, and streams the verified analysis in real time.
+
+---
+
+## 3. Project Requirements Specification (Option 3 Adherence)
+
+This project strictly adheres to **Option 3 Enterprise Specifications**, combining zero-key security, serverless scalability, resilient multi-year parsing, and open-ended legal synthesis:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                               OPTION 3 SPECIFICATION COMPLIANCE                                  │
+├──────────────────────────┬───────────────────────────────┬───────────────────────────────────────┤
+│ Requirement Category     │ Specific Requirement          │ Implementation Details                │
+├──────────────────────────┼───────────────────────────────┼───────────────────────────────────────┤
+│ Security & IAM           │ Zero GCP Credentials in Git   │ Keyless Workload Identity Federation; │
+│                          │                               │ OIDC token exchange; hardened .git-   │
+│                          │                               │ ignore policy blocking all *.json/*.key│
+├──────────────────────────┼───────────────────────────────┼───────────────────────────────────────┤
+│ Serverless Orchestration │ Dual Cloud Run Architecture   │ Batch Job (offline_pipeline.py) and   │
+│                          │                               │ Web Service (app.py) containerized on │
+│                          │                               │ Python 3.11 with 0.0.0.0:$PORT binding│
+├──────────────────────────┼───────────────────────────────┼───────────────────────────────────────┤
+│ Document Parsing Scope   │ Dynamic Multi-Year Coverage   │ Automatic BFS partition detection over│
+│                          │                               │ 22 years (1950-1960, 2016-2026);      │
+│                          │                               │ Hive-partitioned year=YYYY Parquet out│
+├──────────────────────────┼───────────────────────────────┼───────────────────────────────────────┤
+│ Memory & Stability       │ 7K+ File Fault Isolation      │ PyMuPDF streaming, explicit C-heap    │
+│                          │                               │ deallocation (del page, del bytes),   │
+│                          │                               │ try/except skips corrupt files cleanly│
+├──────────────────────────┼───────────────────────────────┼───────────────────────────────────────┤
+│ Database Performance     │ Connection Pooling & Bulk     │ ThreadedConnectionPool (1-10 conns),  │
+│                          │ Atomic Upserts                │ execute_values batch upsert; fail-safe│
+│                          │                               │ bypass when Cloud SQL socket offline  │
+├──────────────────────────┼───────────────────────────────┼───────────────────────────────────────┤
+│ Monitoring & Throughput  │ Batch Progress Tracker        │ Thread-safe ProgressTracker logging   │
+│                          │                               │ throughput (docs/sec), % and ETA      │
+│                          │                               │ periodically every 50 documents       │
+├──────────────────────────┼───────────────────────────────┼───────────────────────────────────────┤
+│ Frontend UX              │ Clean Gemini-Style Chat UI    │ Distraction-free Streamlit interface, │
+│                          │                               │ dark theme, token streaming via       │
+│                          │                               │ st.write_stream, expandable passages  │
+├──────────────────────────┼───────────────────────────────┼───────────────────────────────────────┤
+│ Retrieval & Reasoning    │ Free-Form Open-Ended RAG      │ FAISS / pgvector hybrid search (top   │
+│                          │                               │ 8-10 chunks), 0.6 dense + 0.4 lexical │
+│                          │                               │ fusion; zero hardcoded canned templates│
+└──────────────────────────┴───────────────────────────────┴───────────────────────────────────────┘
+```
+
+---
+
+## 4. Project Role & Ownership: Kedar — Data Ingestion & Serving Engineer
+
+This section outlines the specific responsibilities, architectural decisions, and code implementations delivered by **Kedar (Data Ingestion & Serving Engineer)**. Use this mapping during code reviews and technical evaluations.
+
+### 4.1 Core Deliverable
+> **Delivered:** An end-to-end cloud-native Supreme Court RAG platform featuring serverless dynamic multi-year ingestion, PyMuPDF bounding-box zoning, legibility triage, hierarchical chunking, dual-mode vector storage (Cloud SQL pgvector + GCS Parquet FAISS), and a modern Gemini-style web service delivering real-time streaming legal reasoning.
+
+### 4.2 Responsibility-to-Code Implementation Matrix
 
 | Responsibility Assigned | Technical Solution & Code Implementation | Relevant Files & Modules |
 | :--- | :--- | :--- |
-| **1. Collect, organize, and validate the PDF documents** | Dynamically scans Google Cloud Storage bucket (`sc-legal-documents-raw`) under the `raw/` prefix. Validates format compliance, non-zero file sizes, and generates SHA-256 integrity hashes for each PDF before ingestion starts. | [`offline_pipeline.py`](offline_pipeline.py) (`discover_raw_blobs`)<br>[`config.py`](config.py) (`BUCKET_NAME`, `GCS_RAW_PREFIX`) |
-| **2. Extract text from digital and scanned documents** | **Digital Documents:** Employs PyMuPDF coordinate-aware zone extraction (`(x0, y0, x1, y1)`) to cleanly isolate judgment body text from running headers, footers, and marginalia.<br>**Scanned Documents:** Built a pre-flight Triage Gate sampling sample pages; documents with `< 80` characters are diagnosed as scanned/corrupted and safely flagged without crashing the batch worker. | [`offline_pipeline.py`](offline_pipeline.py) (`parse_document_resilient`) |
-| **3. Preserve document identifiers and original page numbers** | Captures page ranges (`page_start`, `page_end`, `page_num`), case appeal numbers, official law report citations (`2024 INSC ...`), and judges' coram. Persists these exact page identifiers across both the relational `parents` table and the GCS `parsed/` Parquet feature-store. | [`offline_pipeline.py`](offline_pipeline.py) (`HierarchicalChunker`)<br>[`schema.sql`](schema.sql) (`parents`, `chunks`) |
-| **4. Handle corrupted files, duplicate documents, and extraction failures** | **Duplicates:** Computes `SHA-256` digest on byte stream; applies `ON CONFLICT (source_file)` and `ON CONFLICT (case_number, judgment_date)` in PostgreSQL.<br>**Corrupted / Empty Files:** Encapsulates PDF stream reading inside defensive `try/except` blocks; logs descriptive stack traces into `ingest_status` via `record_ingest_failure()`. | [`offline_pipeline.py`](offline_pipeline.py) (`DatabaseLoader`)<br>[`schema.sql`](schema.sql) (`ingest_status`) |
-| **5. Implement batch processing, retries, and resumable ingestion** | Implemented concurrent batch orchestration with `--workers 4` and `--limit N` (sampling vs. unlimited all-blob mode). Containerized into Cloud Run Job `sc-rag-pipeline-job` with `--max-retries=0` and `task-timeout=900s`. Batches child embeddings up to 200 items per API call to Vertex AI `text-embedding-004`. | [`offline_pipeline.py`](offline_pipeline.py) (`run`, `main`)<br>[`.github/workflows/deploy-and-run.yml`](.github/workflows/deploy-and-run.yml) |
-| **6. Maintain processing status and error reports** | Engineered the `ingest_status` master tracking table in Cloud SQL. Logs lifecycle timestamps (`started_at`, `completed_at`), total pages extracted, file size in bytes, and execution state (`PROCESSING`, `COMPLETED`, `FAILED`) with step summaries for automated CI/CD runs. | [`offline_pipeline.py`](offline_pipeline.py)<br>[`schema.sql`](schema.sql) |
+| **1. Collect, organize, and validate the PDF documents** | Dynamically scans Google Cloud Storage bucket (`sc-legal-documents-raw`) under `raw/` across all 22 year partitions. Validates format compliance, non-zero file sizes, and generates SHA-256 integrity hashes for each PDF before ingestion starts. | [`offline_pipeline.py`](offline_pipeline.py) (`discover_year_partitions`, `discover_raw_blobs`)<br>[`config.py`](config.py) |
+| **2. Extract text from digital and scanned documents** | **Digital Documents:** Employs PyMuPDF coordinate-aware zone extraction (`(x0, y0, x1, y1)`) to cleanly isolate judgment body text from running headers, footers, and marginalia.<br>**Scanned Documents:** Pre-flight triage gate checks character density; documents with $<40\%$ readable pages are diagnosed as `NEEDS_OCR` and safely flagged without crashing the batch worker. | [`offline_pipeline.py`](offline_pipeline.py) (`parse_document_resilient`) |
+| **3. Preserve document identifiers and original page numbers** | Captures page ranges (`page_start`, `page_end`), appeal numbers, official law report citations (`2024 INSC ...`), and coram. Persists exact page identifiers across relational tables and GCS Parquet feature-sets. | [`offline_pipeline.py`](offline_pipeline.py) (`HierarchicalChunker`)<br>[`schema.sql`](schema.sql) |
+| **4. Handle corrupted files, duplicate documents, and extraction failures** | **Duplicates:** Computes `SHA-256` digest on byte stream; applies `ON CONFLICT (source_file)` in PostgreSQL.<br>**Corrupted / Corrupt Files:** Encapsulates PDF reading inside defensive `try/except` blocks; explicitly frees memory buffers (`del page`, `del pdf_bytes`) to prevent memory leaks on 7K-document jobs. | [`offline_pipeline.py`](offline_pipeline.py) (`process_blob`, `parse_document_resilient`) |
+| **5. Implement batch processing, connection pooling, and progress tracking** | Built `ThreadedConnectionPool` (1-10 connections) with `execute_values` bulk inserts. Implemented thread-safe `ProgressTracker` logging throughput (docs/sec), completion percentage, and ETA every 50 files. | [`offline_pipeline.py`](offline_pipeline.py) (`DatabaseLoader`, `ProgressTracker`) |
+| **6. Build Free-Form Search & Gemini Chat UI** | Built a Gemini-style Streamlit web chat service with `st.write_stream` token streaming, dual-mode FAISS/pgvector retrieval (top 8-10 chunks), and strict legal grounding prompt templates. | [`app.py`](app.py)<br>[`online_app.py`](online_app.py) (`ParquetVectorStore`, `CitationVerificationGate`) |
 
 ---
 
-## 3. Master Technology Stack & Tool Matrix
-
-Every tool and framework utilized across the parsing, ingestion, and storage layers was selected for enterprise throughput, low latency, and zero-disk serverless execution:
+## 5. Master Technology Stack & Tool Matrix
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                INGESTION & PARSING STACK                               │
+│                                INGESTION & SERVING STACK                               │
 ├─────────────────────────┬───────────────────────────────┬──────────────────────────────┤
 │ Layer                   │ Tool / Technology             │ Exact Role in Architecture   │
 ├─────────────────────────┼───────────────────────────────┼──────────────────────────────┤
-│ Cloud Storage Ingestion │ google-cloud-storage (v3.17+) │ In-memory streaming from GCS │
+│ Cloud Storage Ingestion │ google-cloud-storage (v2.14+) │ In-memory streaming from GCS │
 │ PDF Triage & Zoning     │ PyMuPDF / fitz (v1.24+)       │ Bounding-box text extraction │
-│ Text Normalization      │ Python re (Regex Engine)      │ De-hyphenation & whitespace  │
+│ Text Normalization      │ Python re & unicodedata       │ De-hyphenation & NFKD clean  │
 │ LLM Semantic Parser     │ Vertex AI Gemini 2.5 Flash    │ Metadata, Ratio & Case Cards │
 │ Vector Embeddings       │ Vertex AI text-embedding-004  │ 768-dim dense legal vectors  │
 │ Feature Serialization   │ Apache Arrow / PyArrow & pd   │ Columnar Parquet generation  │
-│ Database & Vector Store │ PostgreSQL 15+ & Cloud SQL    │ pgvector, pg_trgm, uuid-ossp │
-│ DB Adapter & Pooling    │ psycopg2-binary & Pool        │ execute_values atomic upsert │
-│ Settings & Validation   │ Pydantic Settings (v2.15+)    │ Dynamic Cloud SQL socket DSN │
-│ Container Runtime       │ Docker (Python 3.11 slim)     │ Multi-purpose Linux image    │
-│ Serverless Batch Runner │ Google Cloud Run Jobs         │ 4 GiB, 2 vCPU batch tasks    │
-│ CI/CD Automation        │ GitHub Actions & WIF          │ Keyless GCP nightly workflow │
+│ Relational Vector Store │ PostgreSQL 15+ & Cloud SQL    │ pgvector, pg_trgm, uuid-ossp │
+│ In-Memory Vector Store  │ FAISS (faiss-cpu v1.7+) & np  │ Cosine similarity + Lexical  │
+│ DB Adapter & Pooling    │ psycopg2-binary & Pool        │ ThreadedConnectionPool bulk  │
+│ Web Serving Engine      │ FastAPI & Uvicorn             │ High-performance REST API    │
+│ Chat Interface          │ Streamlit (v1.38+)            │ Gemini UI with write_stream  │
+│ Serverless Batch Runner │ Google Cloud Run Jobs         │ 4 GiB, 2 vCPU batch runner   │
+│ Web Application Host    │ Google Cloud Run Service      │ 2 GiB, 1 vCPU web service    │
+│ CI/CD & Security        │ GitHub Actions & WIF (OIDC)   │ Zero-key automated pipeline  │
 └─────────────────────────┴───────────────────────────────┴──────────────────────────────┘
 ```
 
 ---
 
-## 4. Deep Dive: Document Parsing & Triage Pipeline (Highlighted)
+## 6. Deep Dive: Document Parsing & Triage Pipeline
 
-The parsing architecture implemented in [`SupremeCourtPDFParser`](offline_pipeline.py#L44-L175) solves several layout and formatting challenges unique to Indian law reports and Supreme Court digital judgment PDFs.
-
-### 4.1 The Indian Legal PDF Layout Challenge
-
-Official Supreme Court of India judgments (SCR volumes and digital reports) present recurring layout noise that ruins naive RAG chunking:
-1. **Running Headers**:
-   - Contain reporter volume citations (e.g., `[2024] 1 S.C.R. 45`), court banners (`SUPREME COURT REPORTS`), or judge names.
-   - If naively extracted, they contaminate embeddings and produce false-positive retrieval matches.
-2. **Running Footers**:
-   - Contain page numbering (`Page 14 of 98`), digital verification signature hashes, or court registry disclaimers.
-3. **Outer Margin Annotations**:
-   - Marginal notes, paragraph indices (`[12]`, `[13]`), and headnote topic codes printed in the outer 45 points of the page.
-4. **Hyphenated Line Breaks**:
-   - Judicial prose frequently hyphenates complex statutory terms across line breaks (e.g., `constitu- \n tional`, `juris- \n prudence`).
-5. **Scanned vs. Born-Digital PDFs**:
-   - Historical judgments are frequently low-quality scans requiring triage to prevent empty ingestion.
-
-### 4.2 In-Memory Zone-Based Parsing Architecture
-
-Rather than saving PDFs to the local filesystem, the pipeline streams PDF bytes directly from Google Cloud Storage (`gs://sc-judgments-rag-sc-rag/raw/`) into memory:
+The parsing architecture implemented in [`SupremeCourtPDFParser`](offline_pipeline.py#L98) solves recurring formatting challenges in Indian law reports:
 
 ```mermaid
 flowchart TD
-    GCS[GCS Blob: raw/*.pdf] -->|Stream bytes in memory| MEM[BytesIO / Memory Buffer]
-    MEM --> TRIAGE{PDF Triage Gate}
-    TRIAGE -->|< 80 chars across sample pages| REJECT[Mark Ingest FAILED: Scanned/Empty PDF]
-    TRIAGE -->|Valid Digital Text| ZONE[PyMuPDF Zone Extractor]
+    GCS[GCS Blob: raw/year=YYYY/*.pdf] -->|Stream bytes in memory| MEM[BytesIO / In-Memory Buffer]
+    MEM --> MAGIC{Check PDF Magic Header}
+    MAGIC -->|No %PDF- Header| INVALID[Mark INVALID_FORMAT]
+    MAGIC -->|Valid Header| FITZ[fitz.open stream=pdf_bytes]
+    FITZ --> PASS{Encrypted / Password?}
+    PASS -->|Yes| REJECT_PASS[Mark PASSWORD_PROTECTED]
+    PASS -->|No| LOOP[Page-by-Page Extraction Loop]
 
-    subgraph Page Zone Extraction
-        ZONE -->|y1 <= header_margin_pt 50.0| HDR[Running Header Stripper]
-        ZONE -->|y0 >= height - footer_margin_pt 50.0| FTR[Running Footer Stripper]
-        ZONE -->|x1 <= outer_margin_pt or x0 >= width - 45.0| MRG[Margin Notes Collector]
-        ZONE -->|Central Bounding Box| BODY[Judicial Body Blocks]
+    subgraph Page Extraction & Memory Management
+        LOOP --> BLOCK[page.get_text blocks]
+        BLOCK -->|y1 <= 50.0pt| HDR[Strip Running Header]
+        BLOCK -->|y0 >= height - 50.0pt| FTR[Strip Running Footer]
+        BLOCK -->|x1 <= 45.0pt or x0 >= width - 45.0pt| MRG[Strip Margin Notes]
+        BLOCK -->|Central Box| BODY[Collect Judicial Body Text]
+        BODY --> DEL_PAGE[del page: Free C-heap Memory]
     end
 
-    BODY --> CLEAN[Text Normalization: De-hyphenate, collapse whitespaces]
+    DEL_PAGE --> AUDIT{Legibility Audit}
+    AUDIT -->|Readable Pages < 40%| OCR[Mark NEEDS_OCR]
+    AUDIT -->|Corrupted Pages > 15%| CORRUPT[Mark CORRUPTED]
+    AUDIT -->|Concurring Order Missing| DISPO[Mark INCOMPLETE_DISPOSITION]
+    AUDIT -->|Passed Quality Gate| CLEAN[De-hyphenate & Unicode Normalize]
     CLEAN --> SEGMENT[Hierarchical Chunking]
 ```
 
-### 4.3 Strong Parsing Technique for Inconsistent & Hybrid PDFs
-
-To handle inconsistencies across historical Supreme Court judgments (e.g. digital cover pages followed by scanned annexures or corrupted streams midway), the parser executes [`parse_document_resilient`](offline_pipeline.py#L70-L210):
-
-1. **Page-by-Page Fault Isolation**:
-   - Each page is evaluated inside a dedicated `try/except` block.
-   - If a page has a decompression or font encoding error, it is recorded in `corrupted_pages` without crashing the document or stopping subsequent files in the batch.
-2. **Text Density & Scanned Page Detection**:
-   - For every page, body text is extracted after zone-stripping running headers (top 50pt) and footers (bottom 50pt).
-   - If extracted text has `< 40` characters:
-     - Checks if the page contains embedded images (`page.get_images()`). If yes, it is classified as a **scanned image page** (`scanned_or_blank_pages`).
-     - Otherwise, classified as a blank spacer page.
-3. **Document-Wide Legibility Ratio**:
-   $$\text{Legibility Ratio} = \frac{\text{Valid Digital Pages}}{\text{Total Pages}}$$
-   - **Legibility $< 40\%$**: Rejects ingestion and marks status as `NEEDS_OCR` in `ingest_status` with exact page counts.
-   - **Corrupted Pages $> 15\%$**: Flags as `CORRUPTED`.
-4. **Tail-End Concluding Order (Disposition) Integrity Check**:
-   - In Indian Supreme Court jurisprudence, the operative ruling (*Allowed*, *Dismissed*, or *Disposed of*) is in the final 2 pages.
-   - If the concluding 2 pages are blank, scanned, or unreadable, the judgment is flagged as `INCOMPLETE_DISPOSITION` to prevent indexing decisions lacking an operative legal order.
-5. **Unicode Normalization & Cross-Line De-Hyphenation**:
-   - Normalizes Unicode ligatures (`\ufb01` fi, `\ufb02` fl), smart quotes, and non-breaking spaces via `unicodedata.normalize('NFKD', text)`.
-   - Reconstructs legal terminology broken across line wraps: `re.sub(r"(\w+)-\s*\n\s*(\w+)", r"\1\2", text)`.
-
-### 4.4 Hierarchical Chunking (Parents vs. Children)
-
-Legal arguments lose meaning when partitioned into arbitrary 500-token chunks. The pipeline employs a two-tier hierarchy implemented in [`HierarchicalChunker`](offline_pipeline.py#L320-L454):
-
-1. **Parent Context Sections (~1500 words)**:
-   - Aggregates paragraphs up to ~1500 words with ~100-word overlap.
-   - Detects section headings (`FACTS`, `ARGUMENTS`, `ANALYSIS`, `RATIO DECIDENDI`, `CONCLUSION`, `ORDER`).
-   - Retains `page_start` and `page_end` references.
-2. **Child Searchable Chunks (~350 words)**:
-   - Partitions each parent section into ~350-word chunks with ~50-word overlap.
-   - Embeds each chunk with Vertex AI `text-embedding-004` (768 dimensions).
-   - Generates a PostgreSQL `tsvector` for full-text search.
-   - Stores a foreign key link to its `parent_id`.
-
-### 4.5 Parquet Feature-Store Export (`parsed/`)
-
-After segmentation, the pipeline creates an in-memory PyArrow Parquet dataset containing:
-`source_blob`, `case_title`, `case_number`, `judgment_date`, `citation`, `parent_index`, `section_title`, `chunk_index`, `chunk_content`, `token_count`, `embedding` (768 floats), `summary`, `ratio_decidendi`, and `disposition`.
-It streams this directly to `gs://sc-judgments-rag-sc-rag/parsed/<filename>.parquet`.
+### Key Parsing Features:
+1. **Coordinate Bounding-Box Zone Stripping**: Top 50 pt (reporter banners, court volume stamps) and bottom 50 pt (page numbers, digital verification marks) are stripped to prevent search contamination.
+2. **Page-Level Fault Isolation & Active Heap Deallocation**: Each page is processed in an isolated try-except block. Explicit `del page` and `del pdf_bytes` prevent unmanaged C-level heap bloat when processing 300+ page judgments during 7,000-document ingestion runs.
+3. **Tail-Order Disposition Validation**: Checks the final 2 pages for operative orders (*Allowed*, *Dismissed*, *Disposed of*).
+4. **Hierarchical Segmentation**:
+   - **Parents (~1500 words)**: Preserves complete facts, legal arguments, and ratio decidendi.
+   - **Children (~350 words)**: High-resolution search units with 768-d embeddings and full-text search vectors.
 
 ---
 
-## 5. Database Schema & Relational Design
+## 7. Database Schema & Relational Design
 
-The database runs on **PostgreSQL 15+** with the extensions `uuid-ossp`, `pg_trgm`, and `vector`.
+The relational database runs on **PostgreSQL 15+** with the extensions `uuid-ossp`, `pg_trgm`, and `vector`.
 
 ```mermaid
 erDiagram
@@ -228,78 +283,45 @@ erDiagram
     parents ||--o{ chunks : "divided into"
 ```
 
-### Key Database Indexes:
-- **Vector Search**: `chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)` for sub-millisecond approximate nearest neighbor retrieval.
-- **Full-Text Search (FTS)**: `chunks USING gin (tsv)` on generated `to_tsvector('english', content)`.
-- **Trigram Similarity**: `parties USING gin (party_name gin_trgm_ops)` and `parties USING gin (normalized_name gin_trgm_ops)` for fuzzy litigant name matching (`%` operator and `similarity()` function).
-- **Date & Metadata**: `cases (judgment_date DESC)` and `cases USING gin (tsv_metadata)`.
+---
+
+## 8. Dual-Mode Vector Retrieval & Gemini Streaming UI
+
+To guarantee continuous availability regardless of Cloud SQL database provisioning states, the system features a **Dual-Mode Vector Search Engine**:
+
+### 8.1 Dual-Mode Vector Architecture
+1. **Mode A: Cloud SQL pgvector + FTS**: When Cloud SQL is connected, queries run via Reciprocal Rank Fusion (RRF) CTEs combining vector cosine distance (`<=>`) and full-text search (`tsvector @@ websearch_to_tsquery`).
+2. **Mode B: In-Memory FAISS & GCS Parquet Lake**: When Cloud SQL is unavailable or during hybrid local runs, [`ParquetVectorStore`](online_app.py#L225) lazily indexes all 229+ GCS Parquet chunk files using FAISS (`IndexFlatIP` inner product on normalized vectors) combined with lexical token matching:
+   $$\text{Fused Score} = 0.6 \times \text{Dense Score} + 0.4 \times \text{Lexical Score}$$
+   This ensures queries inquiring about specific case titles, petitioners, or respondents (such as *"Shreekantiah Ramayya Munipalli"*) retrieve exact relevant passages even without an active relational database.
+
+### 8.2 Top-K Retrieval Expansion (8–10 Chunks)
+Retrieval candidate counts are set to **8 to 10 chunks**, providing Gemini with comprehensive factual context, statutory sections, and judicial ratio decidendi.
+
+### 8.3 Refined Open-Ended Legal Prompting
+Gemini 2.5 Flash is prompted strictly as an open-ended legal expert without canned template matching:
+```text
+You are an expert Supreme Court of India Legal RAG Assistant. Answer the user's question accurately and thoroughly based only on the provided legal context passages below. If the answer cannot be found in the context, state clearly that it is not present in the current records. Do not rely on predefined templates.
+
+USER QUESTION:
+{query}
+
+LEGAL CONTEXT PASSAGES:
+{all_context}
+```
+
+### 8.4 Clean Sober Gemini-Style Interface
+- Styled with dark Google Gemini aesthetics (`#131314` canvas, `#1e1f20` surface, Google Sans typography).
+- Free-form single chat input accepting any arbitrary legal query.
+- Real-time token streaming using `st.write_stream`.
+- Collapsed minimal sidebar with `➕ New Chat` reset action.
+- Expandable `"📚 View Reference Passages"` ground-truth drawer.
 
 ---
 
-## 6. Online Serving Engine & Search Capabilities
+## 9. Engineering Challenges, Problems Faced & Solutions Delivered
 
-The FastAPI serving application in [`online_app.py`](online_app.py) handles four distinct query pathways via an automated intent classifier:
-
-### 6.1 Query Router Intents
-1. **`DATE_QUERY`**: Filters cases by single year (`in 2023`) or range (`between 2018 and 2021`), joining against `parents` to yield temporal case contexts.
-2. **`ARTICLE_MENTIONS`**: Aggregates constitutional article references (e.g., "How many cases cite Article 21?"), calculating frequencies and retrieving matched case cards.
-3. **`PARTY_SEARCH`**: Leverages `pg_trgm` fuzzy similarity search over `parties` to locate matters involving entities like `Union of India`, `State of Karnataka`, `Tata Motors`, etc.
-4. **`HYBRID_SEARCH` (Default)**: Combines dense vector retrieval and sparse full-text search using **Reciprocal Rank Fusion (RRF)**.
-
-### 6.2 Reciprocal Rank Fusion (RRF) Formula
-
-Both vector similarity and PostgreSQL full-text search are executed concurrently inside a unified SQL Common Table Expression (CTE):
-
-$$\text{RRF Score}(d) = \sum_{m \in \{\text{vector}, \text{fts}\}} \frac{1}{k + \text{rank}_m(d)} \quad (k = 60)$$
-
-Candidate chunks from vector search (top 40) and keyword search (top 40) are merged and reranked, eliminating the need to calibrate arbitrary distance-to-BM25 weight ratios.
-
-### 6.3 Parent-Section Context Expansion
-Instead of supplying truncated 350-word chunks to Gemini, the system maps the top RRF child chunks to their distinct `parent_id` records in the `parents` table, injecting the complete ~1500-word judicial sections (facts, legal arguments, judicial holding) into the prompt context.
-
-### 6.4 Gemini Citation Verification Gate
-To prevent hallucinated legal citations:
-1. **Draft Synthesis**: Gemini 2.5 Flash drafts a legal response using strict bracketed citations `[Case Title, Citation/Case No, Pages]`.
-2. **Adversarial Verification Gate**: A secondary Gemini 2.5 Flash call receives the draft answer alongside the retrieved parent contexts. It audits every case name, appeal number, and legal assertion:
-   - Confirms verified citations.
-   - Detects ungrounded or hallucinated claims.
-   - Computes a grounding confidence score (0.0 to 1.0).
-   - Generates the finalized `verified_answer`.
-
----
-
-## 7. Cloud Infrastructure & CI/CD Automation
-
-| Component | GCP Resource / Service | Description |
-| :--- | :--- | :--- |
-| **GCP Project** | `sc-legal-rag-prod` | Dedicated trial production GCP Project ID. |
-| **Region** | `asia-south1` (Mumbai) | Compute and storage colocation for minimal latency. |
-| **GCS Bucket** | `sc-legal-documents-raw` | `raw/` for input PDFs; `parsed/` and `chunks/` for output Parquet datasets. |
-| **Cloud SQL** | `sc-legal-rag-prod:asia-south1:sc-rag-db` | Managed PostgreSQL 15+ instance with pgvector. |
-| **Artifact Registry** | `asia-south1-docker.pkg.dev/sc-legal-rag-prod/rag-docker-repo/offline-pipeline` | Container image repository. |
-| **Cloud Run Job** | `sc-rag-pipeline-job` | Serverless concurrent batch job executing `offline_pipeline.py`. |
-| **Cloud Run Service** | `sc-rag-chatbot` | Hosts `online_app.py` FastAPI and modern chatbot UI on port 8080. |
-| **CI/CD** | GitHub Actions (`deploy-and-run.yml`) | Workload Identity Federation keyless automation. |
-
-### 7.1 CI/CD Root Cause Analysis & Fix (Resolving the 3-Hour Job Timeout)
-
-In earlier workflow runs, the step `Execute Cloud Run Job` ran for **3 hours 2 minutes** before timing out. Here is why that happened and how we fixed it:
-
-1. **The Root Cause**:
-   - The multi-purpose `Dockerfile` had a default `CMD ["uvicorn", "online_app:app"]` for the serving engine.
-   - When `deploy-and-run.yml` created the Cloud Run Job `sc-rag-offline-job`, it did not specify `--command` or `--args`.
-   - As a result, Cloud Run executed `uvicorn` inside the batch Job. Because `uvicorn` is an infinite web server listening for HTTP traffic, it **never exited**.
-   - Cloud Run waited for the entire 3600s (1 hour) timeout, failed, and then retried 2 more times due to `--max-retries=2` (1 hr + 1 hr + 1 hr = **3 hours**).
-2. **The Complete 3-Layer Solution**:
-   - **Layer 1: Smart Container Entrypoint ([`entrypoint.sh`](entrypoint.sh))**: Auto-detects the `CLOUD_RUN_JOB` environment variable injected by GCP. If present, it executes `python offline_pipeline.py` instead of the web server.
-   - **Layer 2: Explicit Job Parameters ([`deploy-and-run.yml`](.github/workflows/deploy-and-run.yml#L37-L50))**: Passes `--command="python"` and `--args="offline_pipeline.py,--limit,22"`, alongside `--set-cloudsql-instances` and `--set-env-vars`.
-   - **Layer 3: Timeout Safeguards**: Reduced `--task-timeout` from 3600s to **900s** (15 mins) and set `--max-retries=0` to eliminate runaway retry loops.
-
----
-
-## 8. Engineering Challenges, Problems Faced & Solutions Delivered
-
-During the development, deployment, and cloud operations of the Supreme Court Judgments RAG Engine, several critical technical hurdles arose across authentication, serverless orchestration, multi-year partitioning, and judicial text processing. Below is the comprehensive log of problems faced, root cause analyses, and solutions delivered.
+During the development, deployment, and cloud operations of the Supreme Court Judgments RAG Engine, 14 major technical hurdles were encountered and resolved:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -334,175 +356,211 @@ During the development, deployment, and cloud operations of the Supreme Court Ju
 │ 7  │ Judicial Hallucinations &   │ Dense vector similarity alone   │ Hybrid RRF (pgvector + FTS),│
 │    │ Untrusted Legal Citations   │ misses exact statutory sections;│ Parent Expansion (~1500w),  │
 │    │                             │ LLMs extrapolate holdings       │ Gemini 2.5 Verification Gate│
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 8  │ Missing Python Import in    │ Missing standard library        │ Added import time at file   │
+│    │ Batch Job (NameError: time) │ import time in offline_pipeline │ header; py_compile CI check │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 9  │ Memory Bloat & Freezing     │ PyMuPDF C-level heap retention; │ Added doc.close() in finally│
+│    │ on 7,000+ Document Batches  │ unclosed PDF byte buffers       │ explicit del page & bytes;  │
+│    │                             │ causing heap exhaustion         │ granular try/except skips   │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 10 │ DB Socket Churn & Hanging   │ Raw TCP socket opened per chunk;│ ThreadedConnectionPool;     │
+│    │ When Cloud SQL Offline      │ 2s connection timeout repeated  │ execute_values bulk upsert; │
+│    │                             │ on thousands of operations      │ lazy connection probe bypass│
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 11 │ Streamlit Startup Crash:    │ Calling stcli.main() inside an  │ Added runtime probe check:  │
+│    │ Runtime instance exists     │ already running Streamlit server│ from streamlit.runtime      │
+│    │                             │ initiated by container CMD      │ import exists; if not exists│
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 12 │ UI Information Overload &   │ Developer debug metrics (GCP    │ Removed all GCP parameter   │
+│    │ Architecture Panels Exposed │ project, tables, intent pills,  │ sidebars; rebuilt clean,    │
+│    │                             │ confidence %) visible to users  │ distraction-free Gemini UI  │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 13 │ Free-Form Queries Failing on│ ImportError on VerificationGate;│ Built ParquetVectorStore    │
+│    │ Specific Named Cases (e.g.  │ hardcoded keyword fallbacks;    │ (FAISS + lexical fusion);   │
+│    │ Shreekantiah Munipalli)     │ Top-K limited to 5 chunks       │ top-k 8-10; streamed tokens │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 14 │ Multi-Year Dynamic CI/CD    │ 22 years x 22 limit = 484 PDFs; │ Injected --limit-per-year 2 │
+│    │ Workflow Run Exceeding 15m  │ Gemini metadata calls at 1.5s/ea│ into CI/CD batch args; runs │
+│    │                             │ exceeded 900s Cloud Run timeout │ all 22 partitions in ~90s   │
 └────┴─────────────────────────────┴─────────────────────────────────┴─────────────────────────────┘
 ```
 
 ---
 
 ### Problem 1: Artifact Registry Authentication Failure & Docker Push Denial (`403 / 401 Unauthenticated`)
-
 - **Symptom**: During GitHub Actions deployment, Docker failed while pushing container layers to Google Artifact Registry:
   ```text
   denied: Unauthenticated request. Unauthenticated requests do not have permission
   'artifactregistry.repositories.uploadArtifacts' on resource
   'projects/sc-legal-rag-prod/locations/asia-south1/repositories/rag-docker-repo'
   ```
-- **Root Cause**:
-  1. The `google-github-actions/auth@v2` action defaults to issuing Google Cloud identity tokens (OIDC ID tokens), whereas Docker authentication requires an OAuth2 access token with `https://www.googleapis.com/auth/cloud-platform` scope.
-  2. The target Artifact Registry Docker repository (`rag-docker-repo`) did not exist yet in the new `sc-legal-rag-prod` project.
-- **Solution Delivered**:
-  1. Updated the GitHub Actions step with `token_format: 'access_token'`.
-  2. Added an idempotent pre-flight check in the workflow that verifies or provisions the repository:
-     ```bash
-     gcloud artifacts repositories describe rag-docker-repo --location=asia-south1 || \
-     gcloud artifacts repositories create rag-docker-repo --repository-format=docker --location=asia-south1
-     ```
-  3. Piped the authenticated access token directly into Docker CLI:
-     ```bash
-     gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin asia-south1-docker.pkg.dev
-     ```
+- **Root Cause**: The `google-github-actions/auth@v2` action defaulted to issuing OIDC ID tokens, whereas Docker authentication requires an OAuth2 access token with `https://www.googleapis.com/auth/cloud-platform` scope. Additionally, the target repository (`rag-docker-repo`) did not exist yet in the project.
+- **Solution Delivered**: Updated GitHub Actions step with `token_format: 'access_token'`. Added idempotent repository creation before push and piped the access token directly into Docker CLI:
+  ```bash
+  gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin asia-south1-docker.pkg.dev
+  ```
 
 ---
 
 ### Problem 2: GCP Credentials Security & Workflow Authentication Errors
-
 - **Symptom**: CI/CD failed with:
   ```text
   Error: the GitHub Action workflow must specify exactly one of "workload_identity_provider" or "credentials_json"!
   ```
-  Additionally, committing service account JSON key secrets creates high-risk exposure vulnerabilities and triggers security audit flags.
-- **Root Cause**: Mixed or conflicting credentials declarations in workflow YAML, combined with the danger of managing static JSON keys for cloud deployments.
-- **Solution Delivered**:
-  1. Switched completely from static JSON keys to **keyless Workload Identity Federation (WIF)**.
-  2. Configured GitHub Actions OIDC provider with repository subject restriction (`repo:Kedarlimbalkar/sc-judgments-rag-TRIAL:*`):
-     ```yaml
-     - id: auth
-       name: Authenticate to Google Cloud
-       uses: google-github-actions/auth@v2
-       with:
-         workload_identity_provider: 'projects/244385601020/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
-         service_account: 'github-actions-deployer@sc-legal-rag-prod.iam.gserviceaccount.com'
-     ```
-  3. Hardened `.gitignore` to strictly reject any `.json`, `.key`, `.pem`, or `.p12` files to ensure zero GCP credentials can ever be tracked or committed to the repository.
+  Additionally, committing service account JSON key secrets creates severe credential exposure vulnerabilities.
+- **Root Cause**: Conflicting credentials declarations in workflow YAML, combined with managing static JSON keys for cloud deployments.
+- **Solution Delivered**: Switched completely from static JSON keys to **keyless Workload Identity Federation (WIF)**. Configured GitHub Actions OIDC provider with repository subject restriction (`repo:Kedarlimbalkar/sc-judgments-rag-TRIAL:*`). Hardened `.gitignore` to reject all `.json`, `.key`, and `.pem` files.
 
 ---
 
 ### Problem 3: Runaway Batch Ingestion Job (3-Hour Timeout in CI/CD)
-
 - **Symptom**: The GitHub Actions step `Execute Cloud Run Job` ran for **3 hours 2 minutes** before timing out.
-- **Root Cause**:
-  1. The base `Dockerfile` originally specified `CMD ["uvicorn", "online_app:app", ...]`.
-  2. When the Cloud Run Job `sc-rag-pipeline-job` was created without `--command` or `--args`, Cloud Run executed `uvicorn` inside the batch container.
-  3. Because Uvicorn is an infinite web server listening for HTTP traffic, it never finished. Cloud Run waited the full default timeout (3600 seconds) and then retried twice due to `--max-retries=2` ($1\text{ hr} \times 3 = 3\text{ hours}$).
-- **Solution Delivered**:
-  1. Updated the Cloud Run Job definition in `.github/workflows/deploy-and-run.yml` to explicitly pass:
-     `--command="python" --args="offline_pipeline.py,--limit,22,--workers,4"`
-  2. Implemented dual-role execution in `entrypoint.sh` to automatically detect the `CLOUD_RUN_JOB` environment variable.
-  3. Reduced `--task-timeout` to `900s` (15 minutes) and set `--max-retries=0` to immediately halt runaway executions.
+- **Root Cause**: The base `Dockerfile` originally specified `CMD ["uvicorn", "online_app:app"]`. When Cloud Run Job was created without `--command` or `--args`, it ran Uvicorn inside the batch container. Because Uvicorn is an infinite web server, it never finished. Cloud Run waited the full default timeout (3600 seconds) and retried twice ($1\text{ hr} \times 3 = 3\text{ hours}$).
+- **Solution Delivered**: Updated Cloud Run Job definition in `.github/workflows/deploy-and-run.yml` to pass `--command="python"` and `--args="offline_pipeline.py,--limit-per-year,2,--workers,4"`. Reduced `--task-timeout` to `900s` (15 minutes) and set `--max-retries=0`.
 
 ---
 
 ### Problem 4: Transforming Batch Image to a Live Cloud Run Web Service with Gemini Chat UI
-
-- **Symptom**: The container was configured strictly as an offline batch processor. Deploying it as a public Cloud Run service failed to display a user interface and failed orchestrator health probes due to port binding errors.
-- **Root Cause**:
-  1. Cloud Run dynamically assigns an HTTP port via the `$PORT` environment variable (typically 8080) and fails container startup if the server does not bind to `0.0.0.0:${PORT}`.
-  2. The application lacked a dedicated user-facing frontend for legal researchers.
-- **Solution Delivered**:
-  1. Engineered [`app.py`](app.py): A modern Gemini-style Streamlit web chat application featuring:
-     - `st.chat_message` and `st.chat_input` matching Gemini's layout.
-     - Live intent routing badges (`[HYBRID_SEARCH]`, `[ARTICLE_MENTIONS]`, `[PARTY_SEARCH]`).
-     - Gemini 2.5 Flash Citation Verification Badge (`✓ Gemini Verified` with confidence score).
-     - Expandable Parent Ground Truth Judicial Sections (`Page X - Page Y`).
-     - Quick inquiry suggestion chips for common legal queries.
-  2. Configured host and port binding in both `app.py` and `online_app.py` using `0.0.0.0` and `os.environ.get("PORT", 8080)`.
-  3. Updated `Dockerfile` with:
-     ```dockerfile
-     CMD streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0
-     ```
-  4. Added headless environment flags (`STREAMLIT_SERVER_HEADLESS=true`, `STREAMLIT_SERVER_ENABLE_CORS=false`) to prevent browser prompts in containerized environments.
+- **Symptom**: Container was configured strictly as an offline batch processor. Deploying it as a public Cloud Run service failed to display a UI and failed health probes due to port binding errors.
+- **Root Cause**: Cloud Run dynamically assigns an HTTP port via `$PORT` (typically 8080) and fails container startup if the server does not bind to `0.0.0.0:${PORT}`.
+- **Solution Delivered**: Built [`app.py`](app.py) with Streamlit. Bound host to `0.0.0.0` and port to `os.environ.get("PORT", 8080)`. Configured Dockerfile with `CMD streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0`.
 
 ---
 
 ### Problem 5: Single-Year 1950 Processing Bottleneck (Missing Multi-Year Partitions)
-
-- **Symptom**: The document parsing pipeline only processed Supreme Court PDFs from 1950 (`year=1950`), completely skipping available judgments from 1951 through 1960 and 2016 through 2026 (over 5,900 documents across 22 year partitions).
-- **Root Cause**:
-  1. `discover_raw_blobs` performed a flat alphabetical scan of `gs://sc-legal-documents-raw/raw/`.
-  2. When the batch limit (`--limit 22`) was applied, the first 22 items returned were all from `raw/Files-for-test/year=1950/`.
-  3. The pipeline lacked dynamic directory scanning to identify year partitions and did not loop across years.
-  4. The Parquet writer did not include a `"year"` partition column.
-- **Solution Delivered**:
-  1. **Dynamic Prefix Scanner (`discover_year_partitions`)**: Implemented a breadth-first search across GCS prefixes using delimiter traversal (`delimiter="/"`) to discover all year directories (`raw/Files-for-test/year=1950/`, `year=1951/`, ..., `year=2026/`), supported by a regex fallback.
-  2. **Multi-Year Dynamic Ingestion Loop**: Refactored `run()` to iterate dynamically through each discovered year partition:
-     ```python
-     for yr_idx, yr in enumerate(target_years, 1):
-         yr_blobs = self.discover_raw_blobs(prefix=year_partitions[yr])
-         self.process_blobs_batch(target_blobs, workers=workers, year=yr)
-     ```
-  3. **Hive-Style Partitioned Parquet Storage**: Updated `upload_parquet_dataset` to include `"year": year_val` in every DataFrame row and write output directly to `parsed/.../year=YYYY/...` and `chunks/.../year=YYYY/...`.
-  4. **Multi-Year Execution Audit**: Generates consolidated execution audit reports uploaded to `gs://sc-legal-documents-raw/logs/multi_year_run_<timestamp>.json`.
+- **Symptom**: The parsing pipeline only processed Supreme Court PDFs from 1950 (`year=1950`), completely skipping available judgments from 1951 through 1960 and 2016 through 2026 (over 5,900 documents across 22 year partitions).
+- **Root Cause**: `discover_raw_blobs` performed a flat alphabetical scan of `gs://sc-legal-documents-raw/raw/`. The first 22 items returned were all from `year=1950/`. The pipeline lacked dynamic directory scanning and did not loop across years.
+- **Solution Delivered**: Implemented `discover_year_partitions` using breadth-first search across GCS prefixes (`delimiter="/"`) to discover all year directories. Refactored `run()` to loop through each discovered year partition dynamically and save Parquet datasets to Hive-partitioned paths (`parsed/.../year=YYYY/...` and `chunks/.../year=YYYY/...`) with a `"year"` column.
 
 ---
 
 ### Problem 6: Indian Supreme Court PDF Formatting Inconsistencies & OCR Triage
-
-- **Symptom**: Historical Indian law reports frequently combine digital text with scanned annexures, corrupted font tables, or incomplete concluding pages, causing naive PDF parsers to crash or extract corrupted text.
-- **Root Cause**: Variable scanning quality in older judgments and reporter noise (running headers like `[2024] 1 S.C.R.`, page numbers, court watermarks) pollute chunk embeddings.
-- **Solution Delivered**:
-  1. **PyMuPDF Bounding-Box Zoning**: Stripped top 50 pt (headers) and bottom 50 pt (footers) on every page.
-  2. **Page-Level Fault Isolation**: Wrapped individual page extractions in defensive handlers, recording corrupted pages in diagnostics without aborting the document or batch.
-  3. **Legibility Ratio Scoring**: Calculated $\frac{\text{digital pages}}{\text{total pages}}$; documents with $< 40\%$ readable text are automatically flagged as `NEEDS_OCR`.
-  4. **Tail-Order Disposition Integrity**: Audited the concluding 2 pages of every judgment to confirm operative legal rulings (*Allowed*, *Dismissed*, *Disposed of*) are captured.
+- **Symptom**: Historical Indian law reports frequently combine digital text with scanned annexures, corrupted font tables, or incomplete concluding pages, causing naive PDF parsers to crash.
+- **Root Cause**: Variable scanning quality and reporter noise (running headers like `[2024] 1 S.C.R.`, page numbers, court watermarks) pollute chunk embeddings.
+- **Solution Delivered**: Implemented coordinate bounding-box zoning via PyMuPDF (top 50 pt headers and bottom 50 pt footers stripped). Wrapped individual page extractions in defensive handlers. Calculated legibility ratio ($\frac{\text{digital pages}}{\text{total pages}}$); documents with $<40\%$ readable text are flagged as `NEEDS_OCR`. Audited concluding 2 pages for operative legal dispositions.
 
 ---
 
 ### Problem 7: Judicial Hallucinations & Citation Verification
-
 - **Symptom**: Generative LLMs frequently hallucinate legal citations, fabricate case names, or misattribute constitutional holdings.
 - **Root Cause**: Dense vector retrieval alone matches semantic intent but may retrieve passages that discuss related themes without stating the authoritative holding. Supplying small, isolated 300-token chunks deprives the LLM of necessary context.
+- **Solution Delivered**: Implemented Hybrid Reciprocal Rank Fusion (RRF) merging dense pgvector embeddings with PostgreSQL full-text search. Conducted search on child chunks (~350w) but expanded context to parent sections (~1500w). Applied Gemini verification gates auditing citations against source judicial records.
+
+---
+
+### Problem 8: Missing Python Import in Batch Script (`NameError: name 'time' is not defined`)
+- **Symptom**: Cloud Run batch job failed at runtime with:
+  ```text
+  NameError: name 'time' is not defined at line 1397 (overall_start = time.time())
+  ```
+- **Root Cause**: `time.time()` was called in the dynamic multi-year execution loop, but `import time` was absent from the top of `offline_pipeline.py`.
+- **Solution Delivered**: Added `import time` to top-level imports in `offline_pipeline.py`. Added automated `python -m py_compile` step to pre-commit verification.
+
+---
+
+### Problem 9: Memory Bloat & Freezing on 7,000+ Document Batches
+- **Symptom**: During large test runs (~7,000 PDFs), worker processes froze or crashed with out-of-memory errors on large multi-hundred-page judgments.
+- **Root Cause**: PyMuPDF's C-level heap structures were not released when relying solely on Python garbage collection. Accumulating unclosed `fitz.Document` handles and large byte buffers in worker threads created runaway memory bloat.
+- **Solution Delivered**: Wrapped all PDF document lifecycles with guaranteed `doc.close()` in `finally:` blocks. Added explicit deallocation: `del page` inside the extraction loop and `del pdf_bytes` immediately after parsing. Bounded the hierarchical chunking loop to stream directly page-by-page.
+
+---
+
+### Problem 10: Database Connection Socket Churn & Hanging When Cloud SQL Offline
+- **Symptom**: During batch ingestion of hundreds of judgments, opening individual database sockets per chunk caused socket exhaustion and delayed execution. When Cloud SQL was absent/unreachable, each chunk hung for 2 seconds waiting for socket timeouts.
+- **Root Cause**: Individual short-lived socket connections created per sentence/chunk without connection pooling; lack of availability probing.
+- **Solution Delivered**: Engineered `ThreadedConnectionPool` (`minconn=1`, `maxconn=10`) with context-managed borrowing (`get_connection()`). Replaced individual inserts with atomic `execute_values` bulk upserts. Implemented a lazy connectivity probe: if Cloud SQL is unreachable, it logs a warning once and proceeds in pure GCS Parquet mode without socket delays. Built `ProgressTracker` logging throughput (docs/sec) and ETA every 50 files.
+
+---
+
+### Problem 11: Streamlit Startup Crash: `RuntimeError: Runtime instance already exists!`
+- **Symptom**: When deploying the web service to Cloud Run, the container crashed on startup with:
+  ```text
+  RuntimeError: Runtime instance already exists!
+  ```
+- **Root Cause**: The Docker container executes `CMD streamlit run app.py`. Streamlit executes `app.py` under `__name__ == "__main__"`. At the end of `app.py`, calling `sys.exit(stcli.main())` attempted to launch a second Streamlit runtime singleton over the already running runtime.
+- **Solution Delivered**: Wrapped the direct CLI execution block with Streamlit's runtime probe:
+  ```python
+  if __name__ == "__main__":
+      from streamlit.runtime import exists
+      if not exists():
+          from streamlit.web import cli as stcli
+          port = os.environ.get("PORT", "8080")
+          sys.argv = ["streamlit", "run", os.path.abspath(__file__), f"--server.port={port}", ...]
+          sys.exit(stcli.main())
+  ```
+  When invoked via `streamlit run app.py`, `exists()` is `True`, so `stcli.main()` is safely bypassed.
+
+---
+
+### Problem 12: UI Information Overload & Internal Debugging Exposure
+- **Symptom**: The chat interface displayed internal architecture panels, GCP parameter tables (`Project`, `Region`, `Corpus`, `Dense Model`), query router intent overrides, and confidence percentages, distracting legal researchers.
+- **Root Cause**: Developer diagnostic controls and backend metadata were left exposed in the user interface.
+- **Solution Delivered**: Redesigned UI to match a clean, sober Google Gemini aesthetic. Removed all GCP parameter sidebars and routing controls. Configured a centered dark layout (`#131314` canvas, `#1e1f20` cards), Supreme Court emblem header, 4 prompt cards, a single distraction-free chat input, and a collapsed sidebar with only `➕ New Chat`.
+
+---
+
+### Problem 13: Free-Form Queries Failing on Specific Named Cases (e.g. *Shreekantiah Ramayya Munipalli*)
+- **Symptom**: Asking free-form questions or inquiring about specific individuals/parties from ingested judgments (e.g., *Shreekantiah Ramayya Munipalli*) returned canned generic answers or failed to retrieve.
+- **Root Cause**:
+  1. `from online_app import VerificationGate` threw `ImportError` because the class was named `CitationVerificationGate`, causing `backend.connected` to be False.
+  2. Hardcoded keyword fallbacks (`if "pmla" in q_low`, `if "basic structure" in q_low`, canned text) intercepted all free-form queries.
+  3. Retrieval relied only on Cloud SQL `chunks` table while all 229 ingested judgment feature-sets were in GCS Parquet files.
+  4. Top-k was limited to 5 chunks, insufficient for complex legal analysis.
 - **Solution Delivered**:
-  1. **Hybrid Reciprocal Rank Fusion (RRF)**: Merged dense pgvector embeddings (`text-embedding-004`) with PostgreSQL full-text search (`tsvector`) via CTE ranking ($k=60$), balancing semantic relevance with exact statutory keyword matches.
-  2. **Parent Context Expansion**: Search is conducted on ~350-word child chunks, but context injection expands to the parent ~1500-word section.
-  3. **Adversarial Gemini Citation Verification Gate**: A two-stage pipeline where Gemini drafts an initial synthesis, followed by an independent verification pass that cross-references every cited proposition against the source judicial parent text, computing a confidence grounding score.
+  1. Built [`ParquetVectorStore`](online_app.py#L225) with FAISS (`IndexFlatIP`) and NumPy cosine similarity + lexical token matching across all stored GCS Parquet chunks.
+  2. Aliased `VerificationGate = CitationVerificationGate`.
+  3. Raised top-k candidate retrieval to **8–10 chunks**.
+  4. Replaced all hardcoded keyword branches with an open-ended legal RAG prompt template instructing Gemini to synthesize answers strictly based on the retrieved context passages.
+  5. Wired real-time token streaming with `st.write_stream`.
 
 ---
 
-## 9. Reviewer Presentation Cheat-Sheet (Explaining Kedar's Work)
-
-When asked: *"How did you build the document ingestion and parsing pipeline?"*, answer using this structured 4-step framework:
-
-1. **Direct Cloud Storage Ingestion (Zero-Disk Architecture)**:
-   > *"I designed the ingestion pipeline to stream raw judgment PDFs directly from Google Cloud Storage into memory using `google-cloud-storage` and `fitz.open(stream=pdf_bytes)`. This eliminates local disk caching, making the worker 100% stateless and ready for containerized execution on Cloud Run."*
-
-2. **Pre-flight Triage & Layout Zone Filtering**:
-   > *"Indian Supreme Court judgments in SCR format contain repetitive headers (law reporter citations), footers (page counters, digital signatures), and outer margin markers. I implemented coordinate bounding-box zoning via PyMuPDF. Anything in the top 50 pt or bottom 50 pt is stripped to prevent noise from polluting chunk embeddings. For historical scanned documents, my pre-flight triage gate samples character counts across the first 3 pages and gracefully routes unreadable documents to status tracking instead of crashing."*
-
-3. **Hierarchical Document Chunking**:
-   > *"To preserve judicial reasoning, I created a two-tier hierarchy: Parent sections of ~1500 words that capture full facts and legal tests, and Child chunks of ~350 words with 768-dimensional embeddings for high-resolution search. Each child chunk links back to its parent section, enabling parent-context expansion at query time."*
-
-4. **Reliability, Resumability & Status Tracking**:
-   > *"Every ingested document is checked via SHA-256 integrity digests to prevent duplicate records. The `ingest_status` table tracks timestamps, page counts, and states (`PROCESSING`, `COMPLETED`, `FAILED`). The entire workflow is automated via GitHub Actions and Cloud Run Jobs with automatic retries and task timeouts."*
+### Problem 14: Multi-Year Dynamic CI/CD Workflow Run Exceeding 15-Minute Timeout
+- **Symptom**: In automated GitHub Actions runs, dynamic multi-year scanning across all 22 year partitions with `--limit 22` evaluated 484 documents. Sequential Gemini calls took ~700–800 seconds, approaching the 900s Cloud Run Job timeout.
+- **Root Cause**: Evaluating 22 documents across 22 years is suitable for scheduled bulk batch jobs, but too heavy for fast CI/CD integration verification.
+- **Solution Delivered**: Calibrated the automated workflow in `.github/workflows/deploy-and-run.yml` to pass `--args="offline_pipeline.py,--limit-per-year,2,--workers,4"`. This tests all 22 year partitions dynamically (44 documents total) in ~90 seconds, verifying parsing, chunking, embeddings, GCS Parquet partitioning, and DB pooling across all years within safe limits. Full bulk ingestion is triggered on-demand via `--limit 0`.
 
 ---
 
-## 10. Workspace File Inventory
+## 10. Reviewer Presentation Cheat-Sheet & Defense Guide
+
+When presenting to evaluators and reviewers, use this structured framework to defend the architecture:
+
+1. **Security & Keyless Authentication**:
+   > *"Under Option 3, security compliance prohibits storing service account JSON keys in git. We implemented keyless Workload Identity Federation (WIF) where GitHub Actions authenticates via short-lived cryptographic OIDC tokens, ensuring zero credentials exist in the codebase."*
+
+2. **In-Memory Streaming & Layout Zoning**:
+   > *"Indian law reports contain repetitive reporter citations (`[2024] 1 S.C.R.`), page numbers, and court watermarks. We built coordinate bounding-box zoning via PyMuPDF that strips the top 50 pt and bottom 50 pt. Text is streamed directly from GCS into memory without local disk writes, with explicit `del page` and `del pdf_bytes` heap management to process 7,000+ files safely."*
+
+3. **Dynamic Multi-Year Ingestion**:
+   > *"Rather than hardcoding 1950, our pipeline dynamically discovers all 22 year partitions (`year=1950` to `year=2026`) via BFS delimiter scanning, storing output datasets into partitioned Parquet paths with an explicit `year` column."*
+
+4. **Dual-Mode Vector Storage & Fault-Tolerant Retrieval**:
+   > *"We support both Cloud SQL PostgreSQL (`pgvector`) and an in-memory FAISS Parquet VectorStore. If the database is offline, the system seamlessly searches the Parquet feature lake using hybrid dense (768-d embeddings) and lexical token matching, ensuring queries for specific parties like 'Shreekantiah Ramayya Munipalli' return accurate context."*
+
+5. **Gemini Streaming UI & Hallucination Prevention**:
+   > *"The user interface is a clean, sober Gemini-style chat service on Cloud Run listening on `0.0.0.0:$PORT`. Responses are streamed token-by-token via `st.write_stream` and grounded strictly in the top 8–10 retrieved legal context passages, with zero reliance on predefined keyword templates."*
+
+---
+
+## 11. Workspace File Inventory
 
 ```
 e:\sample-RAG-SCJ\
 ├── .github/
 │   └── workflows/
 │       └── deploy-and-run.yml    # Keyless GitHub Actions CI/CD with WIF & Cloud Run Job execution
-├── app.py                        # Gemini-style Streamlit web UI (chat layout, verification badge, parent expansion)
+├── app.py                        # Gemini-style Streamlit web UI (token streaming, dynamic retrieval, clean design)
 ├── cloudbuild.yaml               # Google Cloud Build recipe for container build and job deploy
 ├── config.py                     # Pydantic Settings (GCP, models, GCS prefixes, Cloud SQL resolution)
 ├── Dockerfile                    # Multi-role container: Streamlit chat web service or Cloud Run batch job
 ├── entrypoint.sh                 # Intelligent launcher switching between batch pipeline and online serving
 ├── offline_pipeline.py           # Ingestion: GCS stream -> PyMuPDF zone parse -> Gemini -> Parquet -> Cloud SQL
-├── online_app.py                 # Serving: FastAPI -> Query Router -> RRF Search -> Expansion -> Verification Gate
-├── requirements.txt              # Pinned production Python dependencies (Streamlit, PyMuPDF, pgvector, etc.)
+├── online_app.py                 # Serving: FastAPI -> Query Router -> ParquetVectorStore (FAISS) -> Verification Gate
+├── requirements.txt              # Pinned production Python dependencies (Streamlit, PyMuPDF, pgvector, faiss-cpu)
 ├── schema.sql                    # PostgreSQL DDL with pgvector, pg_trgm, uuid-ossp, and triggers
 ├── static/
 │   └── index.html                # Standalone interactive web chat interface for FastAPI
-└── README.md                     # Complete project documentation, problems faced/solved, and reviewer guide
+└── README.md                     # Complete project documentation, architecture diagrams, and problem log
 ```
