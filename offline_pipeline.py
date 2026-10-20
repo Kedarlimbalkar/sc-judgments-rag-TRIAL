@@ -965,6 +965,81 @@ class OfflineIngestionPipeline:
                 self.bucket.delete_blobs(stale_blobs)
         logger.info("Purged stale output folders. Ready for 100% fresh ingestion from 'raw/'.")
 
+    def discover_year_partitions(
+        self,
+        prefix: str = settings.GCS_RAW_PREFIX
+    ) -> Dict[str, str]:
+        """
+        Dynamically scans the raw storage prefix for all available year directories or folders.
+        Discovers partitions such as 'raw/Files-for-test/year=1950/', 'raw/year=1951/', etc.
+        Returns a dict mapping 4-digit year string to its GCS prefix.
+        """
+        if not self.bucket:
+            logger.error(f"GCS bucket '{settings.BUCKET_NAME}' client not initialized.")
+            return {}
+
+        clean_prefix = prefix.strip()
+        if clean_prefix and not clean_prefix.endswith("/"):
+            clean_prefix += "/"
+
+        logger.info(f"Scanning raw storage prefix gs://{settings.BUCKET_NAME}/{clean_prefix} for year directories...")
+
+        year_partitions: Dict[str, str] = {}
+        queue = [clean_prefix]
+        depth = 0
+        max_depth = 5
+
+        # Breadth-first search for year directory prefixes using GCS delimiter='/'
+        while queue and depth < max_depth:
+            next_queue = []
+            for current_pfx in queue:
+                try:
+                    iterator = self.bucket.list_blobs(prefix=current_pfx, delimiter="/")
+                    list(iterator)  # Consume iterator to populate iterator.prefixes
+                    for sub in iterator.prefixes:
+                        # 1. Match year=YYYY pattern (case-insensitive)
+                        m_eq = re.search(r"year=(\d{4})/?$", sub, re.IGNORECASE)
+                        # 2. Match plain 4-digit year folder /YYYY/
+                        m_yr = re.search(r"/(\d{4})/?$", sub) if not m_eq else None
+                        matched_year = m_eq.group(1) if m_eq else (m_yr.group(1) if m_yr else None)
+
+                        if matched_year:
+                            clean_sub = sub if sub.endswith("/") else sub + "/"
+                            year_partitions[matched_year] = clean_sub
+                            logger.info(f"  -> Discovered year directory: year={matched_year} at gs://{settings.BUCKET_NAME}/{clean_sub}")
+                        else:
+                            # Skip system/output folders
+                            sub_name = Path(sub.rstrip("/")).name.lower()
+                            if sub_name not in ["parsed", "chunks", "exports", "logs", "chroma"]:
+                                next_queue.append(sub)
+                except Exception as e:
+                    logger.warning(f"Error exploring prefix '{current_pfx}': {e}")
+            queue = next_queue
+            depth += 1
+
+        # Fallback: if no directory partitions found via delimiter search,
+        # inspect blob names directly to discover year groupings
+        if not year_partitions:
+            logger.info("No explicit directory prefixes matched. Scanning blob paths for year partitions...")
+            try:
+                blobs = list(self.bucket.list_blobs(prefix=clean_prefix))
+                for b in blobs:
+                    m = re.search(r"year=(\d{4})", b.name, re.IGNORECASE) or re.search(r"/(19\d\d|20\d\d)/", b.name)
+                    if m:
+                        yr = m.group(1)
+                        if yr not in year_partitions:
+                            idx = b.name.find(m.group(0))
+                            prefix_up_to_year = b.name[: idx + len(m.group(0))]
+                            if not prefix_up_to_year.endswith("/"):
+                                prefix_up_to_year += "/"
+                            year_partitions[yr] = prefix_up_to_year
+                            logger.info(f"  -> Discovered year partition from blob: year={yr} at {prefix_up_to_year}")
+            except Exception as e:
+                logger.warning(f"Blob scan fallback failed: {e}")
+
+        logger.info(f"Total year partition(s) discovered: {len(year_partitions)} ({', '.join(sorted(year_partitions.keys()))})")
+        return year_partitions
+
     def discover_raw_blobs(self, prefix: str = settings.GCS_RAW_PREFIX) -> List[storage.Blob]:
         """
         Recursively lists all PDF blobs under the 'raw/' prefix in Cloud Storage.
@@ -1024,12 +1099,29 @@ class OfflineIngestionPipeline:
         metadata: Dict[str, Any],
         parents: List[Dict[str, Any]],
         embeddings: List[List[float]],
+        year: Optional[str] = None,
     ) -> Dict[str, str]:
         """
         Serializes parsed document chunks, metadata, and embeddings to Parquet
-        and uploads directly to GCS under 'parsed/' and 'chunks/' prefixes.
+        and uploads directly to GCS under 'parsed/' and 'chunks/' prefixes
+        partitioned dynamically into respective year partitions (e.g., year=YYYY).
         Returns a dict of destination GCS URIs.
         """
+        # Determine 4-digit year partition dynamically
+        detected_year = None
+        if year:
+            detected_year = str(year)
+        else:
+            m = re.search(r"year=(\d{4})", blob_name, re.IGNORECASE) or re.search(r"/(19\d\d|20\d\d)/", blob_name)
+            if m:
+                detected_year = m.group(1)
+            elif metadata.get("judgment_date"):
+                m_date = re.search(r"\b(19\d\d|20\d\d)\b", str(metadata.get("judgment_date")))
+                if m_date:
+                    detected_year = m_date.group(1)
+
+        year_val = detected_year or "unknown"
+
         rows = []
         card = metadata.get("case_card", {})
         emb_idx = 0
@@ -1038,6 +1130,7 @@ class OfflineIngestionPipeline:
             for c in p["children"]:
                 rows.append({
                     "source_blob": blob_name,
+                    "year": year_val,
                     "case_title": metadata.get("case_title"),
                     "case_number": metadata.get("case_number"),
                     "judgment_date": metadata.get("judgment_date"),
@@ -1076,8 +1169,14 @@ class OfflineIngestionPipeline:
             rel_path = Path(blob_name).name
 
         stem = re.sub(r"\.pdf$", "", rel_path, flags=re.IGNORECASE)
-        parsed_blob_name = f"{settings.GCS_PARQUET_PREFIX}{stem}.parquet"
-        chunks_blob_name = f"{settings.GCS_CHUNKS_PREFIX}{stem}.parquet"
+
+        # Save output parquet files into their respective year partitions (e.g., year=YYYY)
+        if "year=" not in stem:
+            parsed_blob_name = f"{settings.GCS_PARQUET_PREFIX}year={year_val}/{stem}.parquet"
+            chunks_blob_name = f"{settings.GCS_CHUNKS_PREFIX}year={year_val}/{stem}.parquet"
+        else:
+            parsed_blob_name = f"{settings.GCS_PARQUET_PREFIX}{stem}.parquet"
+            chunks_blob_name = f"{settings.GCS_CHUNKS_PREFIX}{stem}.parquet"
 
         # 1. Upload to GCS parsed/
         p_blob = self.bucket.blob(parsed_blob_name)
@@ -1089,10 +1188,10 @@ class OfflineIngestionPipeline:
         c_blob.upload_from_string(parquet_bytes, content_type="application/octet-stream")
         chunks_uri = f"gs://{settings.BUCKET_NAME}/{chunks_blob_name}"
 
-        logger.info(f"Uploaded Parquet feature-sets ({len(rows)} chunks) to {parsed_uri} & {chunks_uri}")
+        logger.info(f"Uploaded Parquet feature-sets ({len(rows)} chunks, partition year={year_val}) to {parsed_uri} & {chunks_uri}")
         return {"parsed_uri": parsed_uri, "chunks_uri": chunks_uri}
 
-    def process_blob(self, blob: storage.Blob) -> bool:
+    def process_blob(self, blob: storage.Blob, year: Optional[str] = None) -> bool:
         """Processes a single PDF blob streamed in-memory from GCS with strong parsing."""
         logger.info(f"--- Processing GCS Blob: {blob.name} ({blob.size} bytes) ---")
         gcs_uri = f"gs://{settings.BUCKET_NAME}/{blob.name}"
@@ -1181,6 +1280,7 @@ class OfflineIngestionPipeline:
                 metadata=metadata,
                 parents=parents,
                 embeddings=embeddings,
+                year=year,
             )
         except Exception as e:
             logger.warning(f"Parquet upload warning for {blob.name}: {e}")
@@ -1204,45 +1304,20 @@ class OfflineIngestionPipeline:
             self.db.record_ingest_failure(blob.name, str(e), status="FAILED")
             return False
 
-    def run(
+    def process_blobs_batch(
         self,
-        limit: Optional[int] = settings.DEFAULT_INGEST_LIMIT,
-        prefix: str = settings.GCS_RAW_PREFIX,
-        purge_stale: bool = False,
+        target_blobs: List[storage.Blob],
         workers: int = 4,
-    ):
-        """
-        Executes GCS ingestion pipeline with concurrent worker pool.
-        Reads raw PDFs from gs://{settings.BUCKET_NAME}/raw/ and writes
-        Parquet feature-sets back to parsed/ and chunks/.
-        """
-        if purge_stale:
-            self.purge_stale_outputs()
-
-        blobs = self.discover_raw_blobs(prefix=prefix)
-        if not blobs:
-            logger.warning(
-                f"No PDF blobs found under gs://{settings.BUCKET_NAME}/{prefix}. "
-                f"Ensure Supreme Court judgment PDFs are uploaded to the bucket."
-            )
-            return
-
-        # Handle limit logic: limit=0 or None means ALL blobs
-        if limit and limit > 0:
-            target_blobs = blobs[:limit]
-            logger.info(f"Processing {len(target_blobs)} of {len(blobs)} blob(s) (limit={limit}, workers={workers})")
-        else:
-            target_blobs = blobs
-            logger.info(f"Processing ALL {len(target_blobs)} discovered GCS blob(s) (unlimited mode, workers={workers})")
-
+        year: Optional[str] = None
+    ) -> Tuple[int, int]:
+        """Processes a batch of PDF blobs concurrently across worker threads."""
         success_count = 0
         failed_count = 0
 
-        # Concurrent batch processing across workers
         if workers > 1 and len(target_blobs) > 1:
-            logger.info(f"Launching ThreadPoolExecutor with {workers} concurrent workers...")
+            logger.info(f"Launching ThreadPoolExecutor with {workers} concurrent workers for {len(target_blobs)} blob(s)...")
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_blob = {executor.submit(self.process_blob, b): b for b in target_blobs}
+                future_to_blob = {executor.submit(self.process_blob, b, year): b for b in target_blobs}
                 for future in as_completed(future_to_blob):
                     b = future_to_blob[future]
                     try:
@@ -1255,11 +1330,11 @@ class OfflineIngestionPipeline:
                         failed_count += 1
                         logger.warning(f"Worker exception processing blob '{b.name}': {exc}")
         else:
-            logger.info("Executing sequentially (workers=1)...")
+            logger.info(f"Executing sequentially (workers=1) for {len(target_blobs)} blob(s)...")
             for idx, b in enumerate(target_blobs, 1):
                 logger.info(f"[{idx}/{len(target_blobs)}] Processing {b.name}...")
                 try:
-                    if self.process_blob(b):
+                    if self.process_blob(b, year=year):
                         success_count += 1
                     else:
                         failed_count += 1
@@ -1267,12 +1342,118 @@ class OfflineIngestionPipeline:
                     failed_count += 1
                     logger.warning(f"Unexpected error processing {b.name}: {e}")
 
-        logger.info(
-            f"Batch ingestion finished: {success_count} succeeded, "
-            f"{failed_count} skipped/failed out of {len(target_blobs)} total."
-        )
+        return success_count, failed_count
 
-        # Write batch audit log to GCS logs/ folder (visible in Cloud Storage Console)
+    def run(
+        self,
+        limit: Optional[int] = settings.DEFAULT_INGEST_LIMIT,
+        prefix: str = settings.GCS_RAW_PREFIX,
+        purge_stale: bool = False,
+        workers: int = 4,
+        year: Optional[str] = "all",
+        limit_per_year: Optional[int] = None,
+    ):
+        """
+        Executes dynamic multi-year GCS ingestion pipeline:
+        1. Scans raw storage prefix for all available year directories or folders.
+        2. Loops through all discovered years dynamically.
+        3. Parses, chunks, embeds, and saves Parquet files to their respective year partitions (e.g., year=YYYY).
+        """
+        if purge_stale:
+            self.purge_stale_outputs()
+
+        # Step 1: Scan the raw storage prefix for all available year directories or folders
+        year_partitions = self.discover_year_partitions(prefix=prefix)
+
+        if not year_partitions:
+            logger.warning(
+                f"No explicit year directories found under gs://{settings.BUCKET_NAME}/{prefix}. "
+                f"Falling back to flat PDF blob discovery."
+            )
+            blobs = self.discover_raw_blobs(prefix=prefix)
+            if not blobs:
+                logger.warning("No PDF blobs found to process.")
+                return
+            target_blobs = blobs[:limit] if limit and limit > 0 else blobs
+            self.process_blobs_batch(target_blobs, workers=workers)
+            return
+
+        # Determine target years to process
+        available_years = sorted(year_partitions.keys())
+        if year and year.lower() != "all":
+            target_years = [y for y in available_years if y == str(year)]
+            if not target_years:
+                logger.error(f"Requested year '{year}' not found in discovered partitions: {available_years}")
+                return
+        else:
+            target_years = available_years
+
+        logger.info(
+            f"🎯 Dynamic Multi-Year Routine: Found {len(available_years)} year directory partitions: "
+            f"{', '.join(available_years)}"
+        )
+        logger.info(f"   Selected target years: {', '.join(target_years)}")
+
+        overall_start = time.time()
+        total_discovered_pdfs = 0
+        total_processed_pdfs = 0
+        total_success = 0
+        total_failed = 0
+        year_audit_summary = {}
+
+        # Step 2: Loop dynamically through all available years
+        for yr_idx, yr in enumerate(target_years, 1):
+            yr_prefix = year_partitions[yr]
+            logger.info("=" * 70)
+            logger.info(f"📁 [{yr_idx}/{len(target_years)}] Ingesting Year Partition: year={yr}")
+            logger.info(f"   Storage Prefix: gs://{settings.BUCKET_NAME}/{yr_prefix}")
+            logger.info("=" * 70)
+
+            # Discover PDFs specifically in this year partition
+            yr_blobs = self.discover_raw_blobs(prefix=yr_prefix)
+            total_discovered_pdfs += len(yr_blobs)
+
+            if not yr_blobs:
+                logger.info(f"No PDF blobs found under year partition '{yr_prefix}'. Continuing.")
+                continue
+
+            # Determine limit for this year (limit_per_year takes precedence over limit)
+            effective_yr_limit = limit_per_year if (limit_per_year and limit_per_year > 0) else limit
+            if effective_yr_limit and effective_yr_limit > 0:
+                target_blobs = yr_blobs[:effective_yr_limit]
+            else:
+                target_blobs = yr_blobs
+
+            logger.info(
+                f"Partition year={yr}: Ingesting {len(target_blobs)} of {len(yr_blobs)} discovered PDF(s) "
+                f"(limit_per_year={effective_yr_limit or 'all'}, workers={workers})..."
+            )
+
+            # Step 3: Parse, chunk, embed, upsert, and save parquet into year={yr} partition
+            yr_success, yr_failed = self.process_blobs_batch(target_blobs, workers=workers, year=yr)
+
+            total_processed_pdfs += len(target_blobs)
+            total_success += yr_success
+            total_failed += yr_failed
+
+            year_audit_summary[yr] = {
+                "prefix": yr_prefix,
+                "discovered": len(yr_blobs),
+                "processed": len(target_blobs),
+                "success": yr_success,
+                "failed": yr_failed,
+            }
+            logger.info(f"✓ Completed Year Partition: year={yr} [Success: {yr_success}, Failed: {yr_failed}]")
+
+        total_elapsed = int(time.time() - overall_start)
+        logger.info("=" * 70)
+        logger.info(
+            f"🏁 Multi-Year Dynamic Ingestion Completed in {total_elapsed}s: "
+            f"{total_success} succeeded, {total_failed} failed across {len(target_years)} year partition(s)."
+        )
+        logger.info("=" * 70)
+
+        # Upload multi-year execution audit report to GCS logs/
         if self.bucket:
             try:
                 run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -1282,22 +1463,25 @@ class OfflineIngestionPipeline:
                     "region": settings.GCP_REGION,
                     "bucket": settings.BUCKET_NAME,
                     "prefix": prefix,
-                    "limit_requested": limit,
+                    "target_year_filter": year,
+                    "limit_per_year": limit_per_year or limit,
                     "workers": workers,
                     "purge_stale": purge_stale,
-                    "total_discovered": len(blobs),
-                    "total_processed": len(target_blobs),
-                    "success_count": success_count,
-                    "failed_count": failed_count,
-                    "processed_files": [b.name for b in target_blobs],
+                    "total_years_discovered": len(available_years),
+                    "total_years_processed": len(target_years),
+                    "total_discovered_pdfs": total_discovered_pdfs,
+                    "total_processed_pdfs": total_processed_pdfs,
+                    "total_success": total_success,
+                    "total_failed": total_failed,
+                    "year_details": year_audit_summary,
                 }
-                log_blob_name = f"{settings.GCS_LOGS_PREFIX}run_{run_ts}.json"
+                log_blob_name = f"{settings.GCS_LOGS_PREFIX}multi_year_run_{run_ts}.json"
                 log_blob = self.bucket.blob(log_blob_name)
                 log_blob.upload_from_string(
                     json.dumps(audit_payload, indent=2),
                     content_type="application/json"
                 )
-                logger.info(f"Uploaded batch audit report to gs://{settings.BUCKET_NAME}/{log_blob_name}")
+                logger.info(f"Uploaded multi-year audit report to gs://{settings.BUCKET_NAME}/{log_blob_name}")
             except Exception as log_err:
                 logger.warning(f"Could not write audit log to GCS: {log_err}")
 
@@ -1320,7 +1504,19 @@ def main():
         "--limit",
         type=int,
         default=settings.DEFAULT_INGEST_LIMIT,
-        help="Maximum number of PDFs to process from GCS (default: 22, 0=all blobs)"
+        help="Maximum number of PDFs to process per year (default: 22, 0=all blobs)"
+    )
+    parser.add_argument(
+        "--limit-per-year",
+        type=int,
+        default=None,
+        help="Optional explicit override for maximum number of PDFs to process per year"
+    )
+    parser.add_argument(
+        "--year",
+        type=str,
+        default="all",
+        help="Specific year partition to process (e.g. 1950, 1951) or 'all' for dynamic multi-year scanning"
     )
     parser.add_argument(
         "--workers",
@@ -1360,9 +1556,12 @@ def main():
         limit=effective_limit,
         prefix=args.prefix,
         purge_stale=args.purge_stale,
-        workers=args.workers
+        workers=args.workers,
+        year=args.year,
+        limit_per_year=args.limit_per_year,
     )
 
 
 if __name__ == "__main__":
     main()
+
