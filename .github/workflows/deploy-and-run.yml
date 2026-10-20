@@ -29,6 +29,12 @@ jobs:
 
       - name: Configure Docker for Artifact Registry
         run: |
+          gcloud artifacts repositories describe rag-docker-repo --location=asia-south1 --project=sc-legal-rag-prod > /dev/null 2>&1 || \
+          gcloud artifacts repositories create rag-docker-repo \
+            --repository-format=docker \
+            --location=asia-south1 \
+            --description="Docker repository for SC Judgments RAG" \
+            --project=sc-legal-rag-prod || true
           gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
           gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin asia-south1-docker.pkg.dev
 
