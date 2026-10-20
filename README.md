@@ -297,7 +297,178 @@ In earlier workflow runs, the step `Execute Cloud Run Job` ran for **3 hours 2 m
 
 ---
 
-## 8. Reviewer Presentation Cheat-Sheet (Explaining Kedar's Work)
+## 8. Engineering Challenges, Problems Faced & Solutions Delivered
+
+During the development, deployment, and cloud operations of the Supreme Court Judgments RAG Engine, several critical technical hurdles arose across authentication, serverless orchestration, multi-year partitioning, and judicial text processing. Below is the comprehensive log of problems faced, root cause analyses, and solutions delivered.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 PROBLEMS FACED & SOLVED MATRIX                                   │
+├────┬─────────────────────────────┬─────────────────────────────────┬─────────────────────────────┤
+│ #  │ Problem / Challenge         │ Root Cause                      │ Engineering Solution        │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 1  │ Artifact Registry 403 / 401 │ Token format defaulted to ID    │ Added token_format: access_ │
+│    │ Docker upload denied        │ token; missing explicit docker  │ token, automatic repo init, │
+│    │                             │ login stdin stream              │ and stdin oauth2 token auth │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 2  │ CI/CD GCP Secret Failures & │ Long-lived service account JSON │ Switched to keyless OIDC    │
+│    │ Credential Leak Risk        │ keys pose security risks and    │ Workload Identity Fed (WIF);│
+│    │                             │ secret injection mismatch       │ hardened .gitignore policy  │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 3  │ Runaway Batch Ingestion     │ Cloud Run Job ran default       │ Injected --command="python" │
+│    │ (3-Hour Timeout in CI/CD)   │ web server (uvicorn) which      │ --args="offline_pipeline.py"│
+│    │                             │ never terminated; 3x retries    │ timeout=900s, max-retries=0 │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 4  │ Offline Batch Image to Live │ Container lacked UI frontend,   │ Built Gemini-style Streamlit│
+│    │ Cloud Run Web Chat Service  │ fixed port bindings failed on   │ app.py; bound host 0.0.0.0; │
+│    │                             │ dynamic Cloud Run $PORT (8080)  │ CMD streamlit run app.py    │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 5  │ Single-Year 1950 Bottleneck │ Flat scan took first 22 blobs   │ Dynamic BFS prefix scanner  │
+│    │ (Skipping 1951-2026 corpus) │ alphabetically from 1950;       │ discover_year_partitions;   │
+│    │                             │ no year loop or partition path  │ dynamic multi-year loop     │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 6  │ Inconsistent PDF Layouts &  │ Corrupted fonts midway, digital │ Page-level fault isolation, │
+│    │ Scanner Header Pollution    │ covers with scanned annexures,  │ bounding-box zone filters,  │
+│    │                             │ running headers skewing search  │ tail disposition validation │
+├────┼─────────────────────────────┼─────────────────────────────────┼─────────────────────────────┤
+│ 7  │ Judicial Hallucinations &   │ Dense vector similarity alone   │ Hybrid RRF (pgvector + FTS),│
+│    │ Untrusted Legal Citations   │ misses exact statutory sections;│ Parent Expansion (~1500w),  │
+│    │                             │ LLMs extrapolate holdings       │ Gemini 2.5 Verification Gate│
+└────┴─────────────────────────────┴─────────────────────────────────┴─────────────────────────────┘
+```
+
+---
+
+### Problem 1: Artifact Registry Authentication Failure & Docker Push Denial (`403 / 401 Unauthenticated`)
+
+- **Symptom**: During GitHub Actions deployment, Docker failed while pushing container layers to Google Artifact Registry:
+  ```text
+  denied: Unauthenticated request. Unauthenticated requests do not have permission
+  'artifactregistry.repositories.uploadArtifacts' on resource
+  'projects/sc-legal-rag-prod/locations/asia-south1/repositories/rag-docker-repo'
+  ```
+- **Root Cause**:
+  1. The `google-github-actions/auth@v2` action defaults to issuing Google Cloud identity tokens (OIDC ID tokens), whereas Docker authentication requires an OAuth2 access token with `https://www.googleapis.com/auth/cloud-platform` scope.
+  2. The target Artifact Registry Docker repository (`rag-docker-repo`) did not exist yet in the new `sc-legal-rag-prod` project.
+- **Solution Delivered**:
+  1. Updated the GitHub Actions step with `token_format: 'access_token'`.
+  2. Added an idempotent pre-flight check in the workflow that verifies or provisions the repository:
+     ```bash
+     gcloud artifacts repositories describe rag-docker-repo --location=asia-south1 || \
+     gcloud artifacts repositories create rag-docker-repo --repository-format=docker --location=asia-south1
+     ```
+  3. Piped the authenticated access token directly into Docker CLI:
+     ```bash
+     gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin asia-south1-docker.pkg.dev
+     ```
+
+---
+
+### Problem 2: GCP Credentials Security & Workflow Authentication Errors
+
+- **Symptom**: CI/CD failed with:
+  ```text
+  Error: the GitHub Action workflow must specify exactly one of "workload_identity_provider" or "credentials_json"!
+  ```
+  Additionally, committing service account JSON key secrets creates high-risk exposure vulnerabilities and triggers security audit flags.
+- **Root Cause**: Mixed or conflicting credentials declarations in workflow YAML, combined with the danger of managing static JSON keys for cloud deployments.
+- **Solution Delivered**:
+  1. Switched completely from static JSON keys to **keyless Workload Identity Federation (WIF)**.
+  2. Configured GitHub Actions OIDC provider with repository subject restriction (`repo:Kedarlimbalkar/sc-judgments-rag-TRIAL:*`):
+     ```yaml
+     - id: auth
+       name: Authenticate to Google Cloud
+       uses: google-github-actions/auth@v2
+       with:
+         workload_identity_provider: 'projects/244385601020/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+         service_account: 'github-actions-deployer@sc-legal-rag-prod.iam.gserviceaccount.com'
+     ```
+  3. Hardened `.gitignore` to strictly reject any `.json`, `.key`, `.pem`, or `.p12` files to ensure zero GCP credentials can ever be tracked or committed to the repository.
+
+---
+
+### Problem 3: Runaway Batch Ingestion Job (3-Hour Timeout in CI/CD)
+
+- **Symptom**: The GitHub Actions step `Execute Cloud Run Job` ran for **3 hours 2 minutes** before timing out.
+- **Root Cause**:
+  1. The base `Dockerfile` originally specified `CMD ["uvicorn", "online_app:app", ...]`.
+  2. When the Cloud Run Job `sc-rag-pipeline-job` was created without `--command` or `--args`, Cloud Run executed `uvicorn` inside the batch container.
+  3. Because Uvicorn is an infinite web server listening for HTTP traffic, it never finished. Cloud Run waited the full default timeout (3600 seconds) and then retried twice due to `--max-retries=2` ($1\text{ hr} \times 3 = 3\text{ hours}$).
+- **Solution Delivered**:
+  1. Updated the Cloud Run Job definition in `.github/workflows/deploy-and-run.yml` to explicitly pass:
+     `--command="python" --args="offline_pipeline.py,--limit,22,--workers,4"`
+  2. Implemented dual-role execution in `entrypoint.sh` to automatically detect the `CLOUD_RUN_JOB` environment variable.
+  3. Reduced `--task-timeout` to `900s` (15 minutes) and set `--max-retries=0` to immediately halt runaway executions.
+
+---
+
+### Problem 4: Transforming Batch Image to a Live Cloud Run Web Service with Gemini Chat UI
+
+- **Symptom**: The container was configured strictly as an offline batch processor. Deploying it as a public Cloud Run service failed to display a user interface and failed orchestrator health probes due to port binding errors.
+- **Root Cause**:
+  1. Cloud Run dynamically assigns an HTTP port via the `$PORT` environment variable (typically 8080) and fails container startup if the server does not bind to `0.0.0.0:${PORT}`.
+  2. The application lacked a dedicated user-facing frontend for legal researchers.
+- **Solution Delivered**:
+  1. Engineered [`app.py`](app.py): A modern Gemini-style Streamlit web chat application featuring:
+     - `st.chat_message` and `st.chat_input` matching Gemini's layout.
+     - Live intent routing badges (`[HYBRID_SEARCH]`, `[ARTICLE_MENTIONS]`, `[PARTY_SEARCH]`).
+     - Gemini 2.5 Flash Citation Verification Badge (`✓ Gemini Verified` with confidence score).
+     - Expandable Parent Ground Truth Judicial Sections (`Page X - Page Y`).
+     - Quick inquiry suggestion chips for common legal queries.
+  2. Configured host and port binding in both `app.py` and `online_app.py` using `0.0.0.0` and `os.environ.get("PORT", 8080)`.
+  3. Updated `Dockerfile` with:
+     ```dockerfile
+     CMD streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0
+     ```
+  4. Added headless environment flags (`STREAMLIT_SERVER_HEADLESS=true`, `STREAMLIT_SERVER_ENABLE_CORS=false`) to prevent browser prompts in containerized environments.
+
+---
+
+### Problem 5: Single-Year 1950 Processing Bottleneck (Missing Multi-Year Partitions)
+
+- **Symptom**: The document parsing pipeline only processed Supreme Court PDFs from 1950 (`year=1950`), completely skipping available judgments from 1951 through 1960 and 2016 through 2026 (over 5,900 documents across 22 year partitions).
+- **Root Cause**:
+  1. `discover_raw_blobs` performed a flat alphabetical scan of `gs://sc-legal-documents-raw/raw/`.
+  2. When the batch limit (`--limit 22`) was applied, the first 22 items returned were all from `raw/Files-for-test/year=1950/`.
+  3. The pipeline lacked dynamic directory scanning to identify year partitions and did not loop across years.
+  4. The Parquet writer did not include a `"year"` partition column.
+- **Solution Delivered**:
+  1. **Dynamic Prefix Scanner (`discover_year_partitions`)**: Implemented a breadth-first search across GCS prefixes using delimiter traversal (`delimiter="/"`) to discover all year directories (`raw/Files-for-test/year=1950/`, `year=1951/`, ..., `year=2026/`), supported by a regex fallback.
+  2. **Multi-Year Dynamic Ingestion Loop**: Refactored `run()` to iterate dynamically through each discovered year partition:
+     ```python
+     for yr_idx, yr in enumerate(target_years, 1):
+         yr_blobs = self.discover_raw_blobs(prefix=year_partitions[yr])
+         self.process_blobs_batch(target_blobs, workers=workers, year=yr)
+     ```
+  3. **Hive-Style Partitioned Parquet Storage**: Updated `upload_parquet_dataset` to include `"year": year_val` in every DataFrame row and write output directly to `parsed/.../year=YYYY/...` and `chunks/.../year=YYYY/...`.
+  4. **Multi-Year Execution Audit**: Generates consolidated execution audit reports uploaded to `gs://sc-legal-documents-raw/logs/multi_year_run_<timestamp>.json`.
+
+---
+
+### Problem 6: Indian Supreme Court PDF Formatting Inconsistencies & OCR Triage
+
+- **Symptom**: Historical Indian law reports frequently combine digital text with scanned annexures, corrupted font tables, or incomplete concluding pages, causing naive PDF parsers to crash or extract corrupted text.
+- **Root Cause**: Variable scanning quality in older judgments and reporter noise (running headers like `[2024] 1 S.C.R.`, page numbers, court watermarks) pollute chunk embeddings.
+- **Solution Delivered**:
+  1. **PyMuPDF Bounding-Box Zoning**: Stripped top 50 pt (headers) and bottom 50 pt (footers) on every page.
+  2. **Page-Level Fault Isolation**: Wrapped individual page extractions in defensive handlers, recording corrupted pages in diagnostics without aborting the document or batch.
+  3. **Legibility Ratio Scoring**: Calculated $\frac{\text{digital pages}}{\text{total pages}}$; documents with $< 40\%$ readable text are automatically flagged as `NEEDS_OCR`.
+  4. **Tail-Order Disposition Integrity**: Audited the concluding 2 pages of every judgment to confirm operative legal rulings (*Allowed*, *Dismissed*, *Disposed of*) are captured.
+
+---
+
+### Problem 7: Judicial Hallucinations & Citation Verification
+
+- **Symptom**: Generative LLMs frequently hallucinate legal citations, fabricate case names, or misattribute constitutional holdings.
+- **Root Cause**: Dense vector retrieval alone matches semantic intent but may retrieve passages that discuss related themes without stating the authoritative holding. Supplying small, isolated 300-token chunks deprives the LLM of necessary context.
+- **Solution Delivered**:
+  1. **Hybrid Reciprocal Rank Fusion (RRF)**: Merged dense pgvector embeddings (`text-embedding-004`) with PostgreSQL full-text search (`tsvector`) via CTE ranking ($k=60$), balancing semantic relevance with exact statutory keyword matches.
+  2. **Parent Context Expansion**: Search is conducted on ~350-word child chunks, but context injection expands to the parent ~1500-word section.
+  3. **Adversarial Gemini Citation Verification Gate**: A two-stage pipeline where Gemini drafts an initial synthesis, followed by an independent verification pass that cross-references every cited proposition against the source judicial parent text, computing a confidence grounding score.
+
+---
+
+## 9. Reviewer Presentation Cheat-Sheet (Explaining Kedar's Work)
 
 When asked: *"How did you build the document ingestion and parsing pipeline?"*, answer using this structured 4-step framework:
 
@@ -315,19 +486,23 @@ When asked: *"How did you build the document ingestion and parsing pipeline?"*, 
 
 ---
 
-## 9. Workspace File Inventory
+## 10. Workspace File Inventory
 
 ```
 e:\sample-RAG-SCJ\
 ├── .github/
 │   └── workflows/
 │       └── deploy-and-run.yml    # Keyless GitHub Actions CI/CD with WIF & Cloud Run Job execution
+├── app.py                        # Gemini-style Streamlit web UI (chat layout, verification badge, parent expansion)
 ├── cloudbuild.yaml               # Google Cloud Build recipe for container build and job deploy
 ├── config.py                     # Pydantic Settings (GCP, models, GCS prefixes, Cloud SQL resolution)
-├── Dockerfile                    # Python 3.11 slim multi-purpose container definition
+├── Dockerfile                    # Multi-role container: Streamlit chat web service or Cloud Run batch job
+├── entrypoint.sh                 # Intelligent launcher switching between batch pipeline and online serving
 ├── offline_pipeline.py           # Ingestion: GCS stream -> PyMuPDF zone parse -> Gemini -> Parquet -> Cloud SQL
 ├── online_app.py                 # Serving: FastAPI -> Query Router -> RRF Search -> Expansion -> Verification Gate
-├── requirements.txt              # Pinned production Python dependencies
+├── requirements.txt              # Pinned production Python dependencies (Streamlit, PyMuPDF, pgvector, etc.)
 ├── schema.sql                    # PostgreSQL DDL with pgvector, pg_trgm, uuid-ossp, and triggers
-└── README.md                     # Complete project documentation and reviewer handoff guide
+├── static/
+│   └── index.html                # Standalone interactive web chat interface for FastAPI
+└── README.md                     # Complete project documentation, problems faced/solved, and reviewer guide
 ```
