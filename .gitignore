@@ -12,6 +12,14 @@ env/
 .env
 .env.*
 
+# GCP Service Account Keys & Credentials (NEVER commit to git)
+*.json
+!package*.json
+!tsconfig*.json
+*.key
+*.pem
+*.p12
+
 # OS generated files
 .DS_Store
 Thumbs.db
