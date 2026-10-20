@@ -27,3 +27,7 @@ Thumbs.db
 # Log files
 *.log
 
+# Architecture diagram files (kept local)
+*.mmd
+*.mermaid
+
