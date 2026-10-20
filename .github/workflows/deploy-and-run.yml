@@ -51,7 +51,7 @@ jobs:
             --region=asia-south1 \
             --project=sc-legal-rag-prod \
             --command="python" \
-            --args="offline_pipeline.py,--limit,22,--workers,4" \
+            --args="offline_pipeline.py,--limit-per-year,2,--workers,4" \
             --set-cloudsql-instances=sc-legal-rag-prod:asia-south1:sc-rag-db \
             --set-env-vars=GCP_PROJECT=sc-legal-rag-prod,GCP_REGION=asia-south1,BUCKET_NAME=sc-legal-documents-raw,CLOUD_SQL_CONNECTION_NAME=sc-legal-rag-prod:asia-south1:sc-rag-db \
             --memory=4Gi \
@@ -63,7 +63,7 @@ jobs:
             --region=asia-south1 \
             --project=sc-legal-rag-prod \
             --command="python" \
-            --args="offline_pipeline.py,--limit,22,--workers,4" \
+            --args="offline_pipeline.py,--limit-per-year,2,--workers,4" \
             --set-cloudsql-instances=sc-legal-rag-prod:asia-south1:sc-rag-db \
             --set-env-vars=GCP_PROJECT=sc-legal-rag-prod,GCP_REGION=asia-south1,BUCKET_NAME=sc-legal-documents-raw,CLOUD_SQL_CONNECTION_NAME=sc-legal-rag-prod:asia-south1:sc-rag-db \
             --memory=4Gi \

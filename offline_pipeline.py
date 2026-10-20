@@ -18,9 +18,11 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +35,7 @@ except ImportError:
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
+from psycopg2.pool import ThreadedConnectionPool
 from google.cloud import storage
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
@@ -46,6 +49,57 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("offline_pipeline")
+
+
+# ==============================================================================
+# Progress & Throughput Tracker for High-Volume Ingestion (7K+ Documents)
+# ==============================================================================
+class ProgressTracker:
+    """Thread-safe batch progress tracker for large-scale ingestion (e.g. 7K PDFs)."""
+
+    def __init__(self, total_files: Optional[int] = None, log_interval: int = 50, label: str = "INGESTION"):
+        self.total = max(1, total_files) if total_files is not None else None
+        self.log_interval = max(1, log_interval)
+        self.label = label
+        self.processed = 0
+        self.success = 0
+        self.failed = 0
+        self.start_time = time.time()
+        self.lock = threading.Lock()
+
+    def update(self, filename: str, is_success: bool, status: str = "OK"):
+        with self.lock:
+            self.processed += 1
+            if is_success:
+                self.success += 1
+            else:
+                self.failed += 1
+
+            total_str = str(self.total) if self.total else "?"
+            pct_str = f" ({(self.processed / self.total * 100.0):.1f}%)" if self.total else ""
+
+            # Log periodically at interval, on the very first file, and upon completion
+            is_boundary = (
+                self.processed == 1
+                or self.processed % self.log_interval == 0
+                or (self.total is not None and self.processed == self.total)
+            )
+
+            if is_boundary:
+                elapsed = time.time() - self.start_time
+                rate = self.processed / elapsed if elapsed > 0 else 0.0
+                if self.total and rate > 0:
+                    remaining = max(0, self.total - self.processed)
+                    eta_sec = remaining / rate
+                    eta_str = f"{int(eta_sec // 60)}m {int(eta_sec % 60)}s" if eta_sec > 0 else "0s"
+                else:
+                    eta_str = "N/A"
+
+                logger.info(
+                    f"📊 [{self.label} {self.processed}/{total_str}{pct_str}] | "
+                    f"✓ Success: {self.success} | ⚠️ Skipped/Failed: {self.failed} | "
+                    f"⚡ Throughput: {rate:.2f} docs/sec | ⏱️ Elapsed: {int(elapsed)}s | ⏳ ETA: {eta_str}"
+                )
 
 
 # ==============================================================================
@@ -104,10 +158,10 @@ class SupremeCourtPDFParser:
                 "complete_text": "",
             }
 
+        doc = None
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             if doc.is_encrypted:
-                doc.close()
                 return {
                     "can_ingest": False,
                     "status": "PASSWORD_PROTECTED",
@@ -118,7 +172,6 @@ class SupremeCourtPDFParser:
                 }
             total_pages = len(doc)
             if total_pages == 0:
-                doc.close()
                 return {
                     "can_ingest": False,
                     "status": "FAILED_CORRUPT",
@@ -127,6 +180,82 @@ class SupremeCourtPDFParser:
                     "pages": [],
                     "complete_text": "",
                 }
+
+            valid_pages: List[int] = []
+            scanned_or_blank_pages: List[Dict[str, Any]] = []
+            corrupted_pages: List[Dict[str, Any]] = []
+            pages_content: List[Dict[str, Any]] = []
+            full_text_parts: List[str] = []
+
+            # Page-by-page fault-isolated extraction with active memory management
+            for page_idx in range(total_pages):
+                page_num = page_idx + 1
+                try:
+                    page = doc[page_idx]
+                    rect = page.rect
+                    width, height = rect.width, rect.height
+
+                    # Extract text blocks: (x0, y0, x1, y1, text, block_no, block_type)
+                    blocks = page.get_text("blocks")
+                    body_blocks: List[str] = []
+                    header_blocks: List[str] = []
+                    footer_blocks: List[str] = []
+                    margin_notes: List[str] = []
+
+                    for b in blocks:
+                        # b[6] == 0 indicates text block
+                        if b[6] != 0:
+                            continue
+
+                        x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
+                        if not text:
+                            continue
+
+                        # Zone: Running Header (Top 50pt)
+                        if y1 <= self.header_margin:
+                            header_blocks.append(text)
+                        # Zone: Running Footer (Bottom 50pt)
+                        elif y0 >= (height - self.footer_margin):
+                            footer_blocks.append(text)
+                        # Zone: Outer Margin (Outer 45pt)
+                        elif x1 <= self.outer_margin or x0 >= (width - self.outer_margin):
+                            margin_notes.append(text)
+                        else:
+                            # Zone: Main Judicial Opinion Body
+                            clean_text = self._clean_block_text(text)
+                            if clean_text:
+                                body_blocks.append(clean_text)
+
+                    page_body = "\n\n".join(body_blocks)
+                    char_count = len(page_body.strip())
+
+                    if char_count < self.min_char_threshold:
+                        # Check for embedded images (scanned pages)
+                        img_count = len(page.get_images())
+                        page_type = "scanned" if img_count > 0 else "blank"
+                        scanned_or_blank_pages.append({
+                            "page_num": page_num,
+                            "type": page_type,
+                            "char_count": char_count,
+                        })
+                    else:
+                        valid_pages.append(page_num)
+                        pages_content.append({
+                            "page_num": page_num,
+                            "header": " | ".join(header_blocks),
+                            "footer": " | ".join(footer_blocks),
+                            "margin_notes": margin_notes,
+                            "body": page_body,
+                        })
+                        full_text_parts.append(page_body)
+
+                    # Explicitly release page object to avoid memory accumulation on large multi-page docs
+                    del page
+
+                except Exception as page_err:
+                    corrupted_pages.append({"page_num": page_num, "error": str(page_err)})
+                    logger.warning(f"Corrupted or unreadable page {page_num} in {blob_name}: {page_err}")
+
         except Exception as e:
             return {
                 "can_ingest": False,
@@ -136,80 +265,12 @@ class SupremeCourtPDFParser:
                 "pages": [],
                 "complete_text": "",
             }
-
-        valid_pages: List[int] = []
-        scanned_or_blank_pages: List[Dict[str, Any]] = []
-        corrupted_pages: List[Dict[str, Any]] = []
-        pages_content: List[Dict[str, Any]] = []
-        full_text_parts: List[str] = []
-
-        # Page-by-page fault-isolated extraction
-        for page_idx in range(total_pages):
-            page_num = page_idx + 1
-            try:
-                page = doc[page_idx]
-                rect = page.rect
-                width, height = rect.width, rect.height
-
-                # Extract text blocks: (x0, y0, x1, y1, text, block_no, block_type)
-                blocks = page.get_text("blocks")
-                body_blocks: List[str] = []
-                header_blocks: List[str] = []
-                footer_blocks: List[str] = []
-                margin_notes: List[str] = []
-
-                for b in blocks:
-                    # b[6] == 0 indicates text block
-                    if b[6] != 0:
-                        continue
-
-                    x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4].strip()
-                    if not text:
-                        continue
-
-                    # Zone: Running Header (Top 50pt)
-                    if y1 <= self.header_margin:
-                        header_blocks.append(text)
-                    # Zone: Running Footer (Bottom 50pt)
-                    elif y0 >= (height - self.footer_margin):
-                        footer_blocks.append(text)
-                    # Zone: Outer Margin (Outer 45pt)
-                    elif x1 <= self.outer_margin or x0 >= (width - self.outer_margin):
-                        margin_notes.append(text)
-                    else:
-                        # Zone: Main Judicial Opinion Body
-                        clean_text = self._clean_block_text(text)
-                        if clean_text:
-                            body_blocks.append(clean_text)
-
-                page_body = "\n\n".join(body_blocks)
-                char_count = len(page_body.strip())
-
-                if char_count < self.min_char_threshold:
-                    # Check for embedded images (scanned pages)
-                    img_count = len(page.get_images())
-                    page_type = "scanned" if img_count > 0 else "blank"
-                    scanned_or_blank_pages.append({
-                        "page_num": page_num,
-                        "type": page_type,
-                        "char_count": char_count,
-                    })
-                else:
-                    valid_pages.append(page_num)
-                    pages_content.append({
-                        "page_num": page_num,
-                        "header": " | ".join(header_blocks),
-                        "footer": " | ".join(footer_blocks),
-                        "margin_notes": margin_notes,
-                        "body": page_body,
-                    })
-                    full_text_parts.append(page_body)
-
-            except Exception as page_err:
-                corrupted_pages.append({"page_num": page_num, "error": str(page_err)})
-                logger.warning(f"Corrupted or unreadable page {page_num} in {blob_name}: {page_err}")
-
-        doc.close()
+        finally:
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
 
         # ----------------------------------------------------------------------
         # Document-Wide Legibility & Quality Health Audit
@@ -482,8 +543,7 @@ class HierarchicalChunker:
         self.child_overlap = child_overlap_words
 
     def chunk_document(self, parsed_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Processes parsed pages into parents and child chunks, tracking page boundaries."""
-        paragraphs = self._extract_paragraphs(parsed_doc)
+        """Processes parsed pages into parents and child chunks, tracking page boundaries safely."""
         parent_sections: List[Dict[str, Any]] = []
 
         curr_p_words: List[str] = []
@@ -491,31 +551,44 @@ class HierarchicalChunker:
         curr_p_end_page = 1
         parent_idx = 0
 
-        for para in paragraphs:
-            para_words = para["text"].split()
-            if not para_words:
+        # Stream paragraphs page-by-page directly to avoid huge intermediate list memory spikes
+        for page in parsed_doc.get("pages", []):
+            page_num = page.get("page_num", 1)
+            raw_body = page.get("body", "")
+            if not raw_body:
                 continue
 
-            if not curr_p_words:
-                curr_p_start_page = para["page_num"]
+            for para in raw_body.split("\n\n"):
+                cleaned = para.strip()
+                if not cleaned:
+                    continue
 
-            curr_p_words.extend(para_words)
-            curr_p_end_page = para["page_num"]
+                para_words = cleaned.split()
+                if not para_words:
+                    continue
 
-            if len(curr_p_words) >= self.parent_target:
-                parent_text = " ".join(curr_p_words)
-                parent_record = self._build_parent_record(
-                    parent_idx=parent_idx,
-                    text=parent_text,
-                    start_page=curr_p_start_page,
-                    end_page=curr_p_end_page
-                )
-                parent_sections.append(parent_record)
-                parent_idx += 1
+                if not curr_p_words:
+                    curr_p_start_page = page_num
 
-                overlap_count = min(self.parent_overlap, len(curr_p_words))
-                curr_p_words = curr_p_words[-overlap_count:] if overlap_count > 0 else []
-                curr_p_start_page = curr_p_end_page
+                curr_p_words.extend(para_words)
+                curr_p_end_page = page_num
+
+                # Bounded loop: chunk into parent records whenever target size is reached
+                while len(curr_p_words) >= self.parent_target:
+                    parent_words = curr_p_words[:self.parent_target]
+                    parent_text = " ".join(parent_words)
+                    parent_record = self._build_parent_record(
+                        parent_idx=parent_idx,
+                        text=parent_text,
+                        start_page=curr_p_start_page,
+                        end_page=curr_p_end_page
+                    )
+                    parent_sections.append(parent_record)
+                    parent_idx += 1
+
+                    overlap_count = min(self.parent_overlap, len(curr_p_words))
+                    curr_p_words = curr_p_words[self.parent_target - overlap_count:] if overlap_count > 0 else curr_p_words[self.parent_target:]
+                    curr_p_start_page = curr_p_end_page
 
         if curr_p_words:
             parent_text = " ".join(curr_p_words)
@@ -655,16 +728,71 @@ class EmbeddingService:
 
 
 # ==============================================================================
-# 5. Cloud SQL / PostgreSQL Bulk Upsert Pipeline
+# 5. Cloud SQL / PostgreSQL Bulk Upsert Pipeline (Connection Pooled)
 # ==============================================================================
 class DatabaseLoader:
-    """Manages transactional bulk upserts and health status tracking into PostgreSQL."""
+    """
+    Manages transactional bulk upserts, connection pooling, and health status tracking into PostgreSQL.
+    Features:
+    - Thread-safe connection pool (ThreadedConnectionPool) to eliminate raw TCP socket churn across 7K PDFs.
+    - Pre-flight connection audit: checks connectivity once with timeout; skips gracefully if Cloud SQL is offline.
+    - Single-transaction atomic batch inserts with execute_values.
+    """
 
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, minconn: int = 1, maxconn: int = 10):
         self.dsn = dsn
+        self.minconn = minconn
+        self.maxconn = maxconn
+        self._pool: Optional[ThreadedConnectionPool] = None
+        self._available: Optional[bool] = None
+        self._checked: bool = False
 
+    def is_available(self) -> bool:
+        """Lazily checks if database connectivity is available and initializes the connection pool."""
+        if self._checked:
+            return bool(self._available and self._pool is not None)
+
+        self._checked = True
+        try:
+            self._pool = ThreadedConnectionPool(
+                minconn=self.minconn,
+                maxconn=self.maxconn,
+                dsn=self.dsn,
+                connect_timeout=3
+            )
+            # Test one connection from pool to confirm validity
+            test_conn = self._pool.getconn()
+            self._pool.putconn(test_conn)
+            self._available = True
+            logger.info(f"Database connection pool initialized (min={self.minconn}, max={self.maxconn}).")
+            return True
+        except Exception as e:
+            logger.warning(f"Database connection pool offline ({e}). Pipeline will operate safely in GCS Parquet mode.")
+            self._available = False
+            self._pool = None
+            return False
+
+    @contextmanager
     def get_connection(self):
-        return psycopg2.connect(self.dsn)
+        """Context manager yielding a pooled connection with guaranteed return in finally."""
+        if not self.is_available() or self._pool is None:
+            raise ConnectionError("Database connection pool is offline.")
+        conn = None
+        try:
+            conn = self._pool.getconn()
+            yield conn
+        finally:
+            if conn is not None and self._pool is not None:
+                self._pool.putconn(conn)
+
+    def close(self):
+        """Safely closes all pooled connections."""
+        if self._pool is not None:
+            try:
+                self._pool.closeall()
+            except Exception:
+                pass
+            self._pool = None
 
     def record_ingest_start(
         self,
@@ -672,57 +800,73 @@ class DatabaseLoader:
         gcs_uri: str,
         file_hash: str,
         file_size_bytes: int
-    ) -> str:
+    ) -> Optional[str]:
         """Creates or updates initial PROCESSING ingest record."""
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO ingest_status (
-                        source_file, gcs_uri, file_hash, file_size_bytes, status, started_at
-                    ) VALUES (%s, %s, %s, %s, 'PROCESSING', NOW())
-                    ON CONFLICT (source_file) DO UPDATE SET
-                        gcs_uri = EXCLUDED.gcs_uri,
-                        file_hash = EXCLUDED.file_hash,
-                        file_size_bytes = EXCLUDED.file_size_bytes,
-                        status = 'PROCESSING',
-                        started_at = NOW(),
-                        error_message = NULL
-                    RETURNING id;
-                    """,
-                    (source_file, gcs_uri, file_hash, file_size_bytes)
-                )
-                ingest_id = str(cur.fetchone()[0])
-            conn.commit()
-        return ingest_id
+        if not self.is_available():
+            return None
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO ingest_status (
+                            source_file, gcs_uri, file_hash, file_size_bytes, status, started_at
+                        ) VALUES (%s, %s, %s, %s, 'PROCESSING', NOW())
+                        ON CONFLICT (source_file) DO UPDATE SET
+                            gcs_uri = EXCLUDED.gcs_uri,
+                            file_hash = EXCLUDED.file_hash,
+                            file_size_bytes = EXCLUDED.file_size_bytes,
+                            status = 'PROCESSING',
+                            started_at = NOW(),
+                            error_message = NULL
+                        RETURNING id;
+                        """,
+                        (source_file, gcs_uri, file_hash, file_size_bytes)
+                    )
+                    ingest_id = str(cur.fetchone()[0])
+                conn.commit()
+            return ingest_id
+        except Exception as e:
+            logger.debug(f"DB record_ingest_start skipped for '{source_file}': {e}")
+            return None
 
     def record_ingest_failure(self, filename: str, error_msg: str, status: str = "FAILED"):
         """Records diagnostic status (FAILED, NEEDS_OCR, CORRUPTED, INCOMPLETE_DISPOSITION)."""
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE ingest_status
-                    SET status = %s, error_message = %s, updated_at = NOW()
-                    WHERE source_file = %s;
-                    """,
-                    (status, error_msg, filename)
-                )
-            conn.commit()
+        if not self.is_available():
+            return
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE ingest_status
+                        SET status = %s, error_message = %s, updated_at = NOW()
+                        WHERE source_file = %s;
+                        """,
+                        (status, error_msg, filename)
+                    )
+                conn.commit()
+        except Exception as e:
+            logger.debug(f"DB record_ingest_failure skipped for '{filename}': {e}")
 
     def record_ingest_complete(self, filename: str, total_pages: int, audit_msg: Optional[str] = None):
         """Records successful ingestion with page counts and diagnostic summary."""
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE ingest_status
-                    SET status = 'COMPLETED', total_pages = %s, error_message = %s, completed_at = NOW(), updated_at = NOW()
-                    WHERE source_file = %s;
-                    """,
-                    (total_pages, audit_msg, filename)
-                )
-            conn.commit()
+        if not self.is_available():
+            return
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE ingest_status
+                        SET status = 'COMPLETED', total_pages = %s, error_message = %s, completed_at = NOW(), updated_at = NOW()
+                        WHERE source_file = %s;
+                        """,
+                        (total_pages, audit_msg, filename)
+                    )
+                conn.commit()
+        except Exception as e:
+            logger.debug(f"DB record_ingest_complete skipped for '{filename}': {e}")
 
     def load_case_payload(
         self,
@@ -732,185 +876,192 @@ class DatabaseLoader:
         parents: List[Dict[str, Any]],
         embeddings: List[List[float]],
         total_pages: int,
-    ):
+    ) -> bool:
         """
         Atomically upserts a complete judgment bundle:
         cases -> parties -> article_mentions -> case_cards -> parents -> chunks.
         """
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                # 1. Upsert Case Master Record
-                cur.execute(
-                    """
-                    INSERT INTO cases (
-                        case_number, case_title, judgment_date, petitioner, respondent,
-                        bench, coram, citation, source_file, gcs_uri, total_pages, headnote
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (source_file) DO UPDATE SET
-                        case_number = EXCLUDED.case_number,
-                        case_title = EXCLUDED.case_title,
-                        judgment_date = EXCLUDED.judgment_date,
-                        petitioner = EXCLUDED.petitioner,
-                        respondent = EXCLUDED.respondent,
-                        bench = EXCLUDED.bench,
-                        coram = EXCLUDED.coram,
-                        citation = EXCLUDED.citation,
-                        gcs_uri = EXCLUDED.gcs_uri,
-                        total_pages = EXCLUDED.total_pages,
-                        headnote = EXCLUDED.headnote,
-                        updated_at = NOW()
-                    RETURNING id;
-                    """,
-                    (
-                        metadata.get("case_number", f"REF-{Path(filename).stem}"),
-                        metadata.get("case_title", Path(filename).name),
-                        metadata.get("judgment_date"),
-                        metadata.get("petitioner"),
-                        metadata.get("respondent"),
-                        metadata.get("bench", []),
-                        metadata.get("coram"),
-                        metadata.get("citation"),
-                        filename,
-                        gcs_uri,
-                        total_pages,
-                        metadata.get("headnote"),
-                    )
-                )
-                case_id = str(cur.fetchone()[0])
-
-                # 2. Re-initialize child tables for idempotency
-                cur.execute("DELETE FROM parties WHERE case_id = %s;", (case_id,))
-                cur.execute("DELETE FROM article_mentions WHERE case_id = %s;", (case_id,))
-                cur.execute("DELETE FROM case_cards WHERE case_id = %s;", (case_id,))
-                cur.execute("DELETE FROM parents WHERE case_id = %s;", (case_id,))
-
-                # 3. Bulk Insert Parties
-                parties_data = []
-                for p in metadata.get("parties", []):
-                    name = p.get("party_name", "").strip()
-                    ptype = p.get("party_type", "PETITIONER").upper()
-                    norm_name = re.sub(r"[^A-Z0-9\s]", "", name.upper()).strip()
-                    if name:
-                        parties_data.append((case_id, name, ptype, norm_name))
-
-                if parties_data:
-                    execute_values(
-                        cur,
-                        """
-                        INSERT INTO parties (case_id, party_name, party_type, normalized_name)
-                        VALUES %s;
-                        """,
-                        parties_data
-                    )
-
-                # 4. Bulk Insert Article Mentions
-                art_data = []
-                for a in metadata.get("article_mentions", []):
-                    raw = a.get("article_raw", "").strip()
-                    clean = a.get("article_clean", "").strip()
-                    snippet = a.get("context_snippet", "")
-                    if clean:
-                        art_data.append((case_id, raw, clean, 1, snippet))
-
-                if art_data:
-                    execute_values(
-                        cur,
-                        """
-                        INSERT INTO article_mentions (case_id, article_raw, article_clean, mention_count, context_snippet)
-                        VALUES %s;
-                        """,
-                        art_data
-                    )
-
-                # 5. Insert Case Card
-                card = metadata.get("case_card", {})
-                if card:
+        if not self.is_available():
+            return False
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    # 1. Upsert Case Master Record
                     cur.execute(
                         """
-                        INSERT INTO case_cards (
-                            case_id, summary, ratio_decidendi, legal_issues, disposition,
-                            acts_referred, cases_cited, metadata
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                        INSERT INTO cases (
+                            case_number, case_title, judgment_date, petitioner, respondent,
+                            bench, coram, citation, source_file, gcs_uri, total_pages, headnote
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (source_file) DO UPDATE SET
+                            case_number = EXCLUDED.case_number,
+                            case_title = EXCLUDED.case_title,
+                            judgment_date = EXCLUDED.judgment_date,
+                            petitioner = EXCLUDED.petitioner,
+                            respondent = EXCLUDED.respondent,
+                            bench = EXCLUDED.bench,
+                            coram = EXCLUDED.coram,
+                            citation = EXCLUDED.citation,
+                            gcs_uri = EXCLUDED.gcs_uri,
+                            total_pages = EXCLUDED.total_pages,
+                            headnote = EXCLUDED.headnote,
+                            updated_at = NOW()
+                        RETURNING id;
                         """,
                         (
-                            case_id,
-                            card.get("summary", ""),
-                            card.get("ratio_decidendi", ""),
-                            card.get("legal_issues", []),
-                            card.get("disposition", "Disposed of"),
-                            card.get("acts_referred", []),
-                            card.get("cases_cited", []),
-                            json.dumps(card),
+                            metadata.get("case_number", f"REF-{Path(filename).stem}"),
+                            metadata.get("case_title", Path(filename).name),
+                            metadata.get("judgment_date"),
+                            metadata.get("petitioner"),
+                            metadata.get("respondent"),
+                            metadata.get("bench", []),
+                            metadata.get("coram"),
+                            metadata.get("citation"),
+                            filename,
+                            gcs_uri,
+                            total_pages,
+                            metadata.get("headnote"),
                         )
                     )
+                    case_id = str(cur.fetchone()[0])
 
-                # 6. Bulk Insert Parent Sections
-                parents_insert_tuples = [
-                    (
-                        case_id,
-                        p["parent_index"],
-                        p["section_title"],
-                        p["content"],
-                        p["word_count"],
-                        p["page_start"],
-                        p["page_end"],
-                    )
-                    for p in parents
-                ]
+                    # 2. Re-initialize child tables for idempotency
+                    cur.execute("DELETE FROM parties WHERE case_id = %s;", (case_id,))
+                    cur.execute("DELETE FROM article_mentions WHERE case_id = %s;", (case_id,))
+                    cur.execute("DELETE FROM case_cards WHERE case_id = %s;", (case_id,))
+                    cur.execute("DELETE FROM parents WHERE case_id = %s;", (case_id,))
 
-                cur.execute(
-                    """
-                    CREATE TEMP TABLE temp_parents_input (
-                        case_id UUID, parent_index INT, section_title VARCHAR,
-                        content TEXT, word_count INT, page_start INT, page_end INT
-                    ) ON COMMIT DROP;
-                    """
-                )
-                execute_values(
-                    cur,
-                    "INSERT INTO temp_parents_input VALUES %s;",
-                    parents_insert_tuples
-                )
+                    # 3. Bulk Insert Parties
+                    parties_data = []
+                    for p in metadata.get("parties", []):
+                        name = p.get("party_name", "").strip()
+                        ptype = p.get("party_type", "PETITIONER").upper()
+                        norm_name = re.sub(r"[^A-Z0-9\s]", "", name.upper()).strip()
+                        if name:
+                            parties_data.append((case_id, name, ptype, norm_name))
 
-                cur.execute(
-                    """
-                    INSERT INTO parents (case_id, parent_index, section_title, content, word_count, page_start, page_end)
-                    SELECT case_id, parent_index, section_title, content, word_count, page_start, page_end
-                    FROM temp_parents_input
-                    RETURNING id, parent_index;
-                    """
-                )
-                parent_id_map = {row[1]: str(row[0]) for row in cur.fetchall()}
+                    if parties_data:
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO parties (case_id, party_name, party_type, normalized_name)
+                            VALUES %s;
+                            """,
+                            parties_data
+                        )
 
-                # 7. Bulk Insert Child Chunks with Vectors
-                chunk_tuples = []
-                emb_idx = 0
-                for p in parents:
-                    p_id = parent_id_map[p["parent_index"]]
-                    for c in p["children"]:
-                        vector_str = "[" + ",".join(str(f) for f in embeddings[emb_idx]) + "]"
-                        chunk_tuples.append((
-                            p_id,
+                    # 4. Bulk Insert Article Mentions
+                    art_data = []
+                    for a in metadata.get("article_mentions", []):
+                        raw = a.get("article_raw", "").strip()
+                        clean = a.get("article_clean", "").strip()
+                        snippet = a.get("context_snippet", "")
+                        if clean:
+                            art_data.append((case_id, raw, clean, 1, snippet))
+
+                    if art_data:
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO article_mentions (case_id, article_raw, article_clean, mention_count, context_snippet)
+                            VALUES %s;
+                            """,
+                            art_data
+                        )
+
+                    # 5. Insert Case Card
+                    card = metadata.get("case_card", {})
+                    if card:
+                        cur.execute(
+                            """
+                            INSERT INTO case_cards (
+                                case_id, summary, ratio_decidendi, legal_issues, disposition,
+                                acts_referred, cases_cited, metadata
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                            """,
+                            (
+                                case_id,
+                                card.get("summary", ""),
+                                card.get("ratio_decidendi", ""),
+                                card.get("legal_issues", []),
+                                card.get("disposition", "Disposed of"),
+                                card.get("acts_referred", []),
+                                card.get("cases_cited", []),
+                                json.dumps(card),
+                            )
+                        )
+
+                    # 6. Bulk Insert Parent Sections
+                    parents_insert_tuples = [
+                        (
                             case_id,
-                            c["chunk_index"],
-                            c["content"],
-                            c["token_count"],
-                            vector_str,
-                        ))
-                        emb_idx += 1
+                            p["parent_index"],
+                            p["section_title"],
+                            p["content"],
+                            p["word_count"],
+                            p["page_start"],
+                            p["page_end"],
+                        )
+                        for p in parents
+                    ]
 
-                if chunk_tuples:
+                    cur.execute(
+                        """
+                        CREATE TEMP TABLE temp_parents_input (
+                            case_id UUID, parent_index INT, section_title VARCHAR,
+                            content TEXT, word_count INT, page_start INT, page_end INT
+                        ) ON COMMIT DROP;
+                        """
+                    )
                     execute_values(
                         cur,
-                        """
-                        INSERT INTO chunks (parent_id, case_id, chunk_index, content, token_count, embedding)
-                        VALUES %s;
-                        """,
-                        chunk_tuples,
-                        template="(%s, %s, %s, %s, %s, %s::vector)"
+                        "INSERT INTO temp_parents_input VALUES %s;",
+                        parents_insert_tuples
                     )
 
-            conn.commit()
+                    cur.execute(
+                        """
+                        INSERT INTO parents (case_id, parent_index, section_title, content, word_count, page_start, page_end)
+                        SELECT case_id, parent_index, section_title, content, word_count, page_start, page_end
+                        FROM temp_parents_input
+                        RETURNING id, parent_index;
+                        """
+                    )
+                    parent_id_map = {row[1]: str(row[0]) for row in cur.fetchall()}
+
+                    # 7. Bulk Insert Child Chunks with Vectors
+                    chunk_tuples = []
+                    emb_idx = 0
+                    for p in parents:
+                        p_id = parent_id_map[p["parent_index"]]
+                        for c in p["children"]:
+                            vector_str = "[" + ",".join(str(f) for f in embeddings[emb_idx]) + "]"
+                            chunk_tuples.append((
+                                p_id,
+                                case_id,
+                                c["chunk_index"],
+                                c["content"],
+                                c["token_count"],
+                                vector_str,
+                            ))
+                            emb_idx += 1
+
+                    if chunk_tuples:
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO chunks (parent_id, case_id, chunk_index, content, token_count, embedding)
+                            VALUES %s;
+                            """,
+                            chunk_tuples,
+                            template="(%s, %s, %s, %s, %s, %s::vector)"
+                        )
+
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to persist {filename} into Cloud SQL: {e}")
+            return False
 
 
 # ==============================================================================
@@ -1192,156 +1343,197 @@ class OfflineIngestionPipeline:
         logger.info(f"Uploaded Parquet feature-sets ({len(rows)} chunks, partition year={year_val}) to {parsed_uri} & {chunks_uri}")
         return {"parsed_uri": parsed_uri, "chunks_uri": chunks_uri}
 
-    def process_blob(self, blob: storage.Blob, year: Optional[str] = None) -> bool:
-        """Processes a single PDF blob streamed in-memory from GCS with strong parsing."""
-        logger.info(f"--- Processing GCS Blob: {blob.name} ({blob.size} bytes) ---")
-        gcs_uri = f"gs://{settings.BUCKET_NAME}/{blob.name}"
-
-        # Step 1: Download bytes into memory
+    def _safe_record_start(self, source_file: str, gcs_uri: str, file_hash: str, file_size: int):
         try:
-            pdf_bytes = blob.download_as_bytes()
+            self.db.record_ingest_start(source_file, gcs_uri, file_hash, file_size)
         except Exception as e:
-            logger.warning(f"Failed to stream blob '{blob.name}' from GCS: {e}")
-            self.db.record_ingest_failure(blob.name, f"Download failure: {str(e)}", status="FAILED_DOWNLOAD")
-            return False
+            logger.debug(f"DB start record skipped for '{source_file}': {e}")
 
-        if not pdf_bytes:
-            logger.warning(f"Skipping zero-byte blob '{blob.name}'")
-            self.db.record_ingest_failure(blob.name, "Zero-byte file", status="FAILED_EMPTY")
-            return False
-
-        file_hash = hashlib.sha256(pdf_bytes).hexdigest()
-
-        # Step 2: Register processing state in Cloud SQL
+    def _safe_record_failure(self, source_file: str, error_msg: str, status: str = "FAILED"):
         try:
-            self.db.record_ingest_start(
-                source_file=blob.name,
-                gcs_uri=gcs_uri,
-                file_hash=file_hash,
-                file_size_bytes=len(pdf_bytes)
-            )
+            self.db.record_ingest_failure(source_file, error_msg, status=status)
         except Exception as e:
-            logger.warning(f"DB warning recording start for '{blob.name}': {e}")
+            logger.debug(f"DB failure record skipped for '{source_file}': {e}")
 
-        # Step 3: Strong Parsing Pass (Health Audited & Fault Isolated)
+    def _safe_record_complete_and_load(
+        self,
+        filename: str,
+        gcs_uri: str,
+        metadata: Dict[str, Any],
+        parents: List[Dict[str, Any]],
+        embeddings: List[List[float]],
+        total_pages: int,
+        audit_note: str,
+    ):
         try:
-            parsed_res = self.parser.parse_document_resilient(pdf_bytes, blob.name)
-        except Exception as parse_err:
-            logger.warning(f"Unreadable or corrupted PDF stream in '{blob.name}': {parse_err}")
-            self.db.record_ingest_failure(blob.name, f"Parse error: {str(parse_err)}", status="CORRUPTED")
-            return False
-
-        if not parsed_res["can_ingest"]:
-            logger.warning(
-                f"Skipping {blob.name} [{parsed_res['status']}]: {parsed_res['reason']}"
-            )
-            self.db.record_ingest_failure(
-                filename=blob.name,
-                error_msg=parsed_res["reason"],
-                status=parsed_res["status"]
-            )
-            return False
-
-        total_pages = parsed_res["total_pages"]
-        complete_text = parsed_res["complete_text"]
-        audit_note = parsed_res["reason"]
-
-        # Step 4: Extract Judicial Metadata via Gemini 2.5 Flash
-        try:
-            logger.info(f"Extracting metadata & case card for {blob.name}...")
-            metadata = self.metadata_extractor.extract_metadata(complete_text, blob.name)
-        except Exception as meta_err:
-            logger.warning(f"Metadata extraction warning for '{blob.name}': {meta_err}. Using fallback.")
-            metadata = self.metadata_extractor._heuristic_metadata(complete_text, blob.name)
-
-        # Step 5: Hierarchical Chunking (Parents ~1500 words, Children ~350 words)
-        try:
-            logger.info(f"Segmenting into parent-child hierarchy for {blob.name}...")
-            parents = self.chunker.chunk_document(parsed_res)
-            total_children = sum(len(p["children"]) for p in parents)
-            logger.info(f"Generated {len(parents)} parents and {total_children} child chunks for {blob.name}.")
-        except Exception as chunk_err:
-            logger.warning(f"Chunking error for '{blob.name}': {chunk_err}")
-            self.db.record_ingest_failure(blob.name, f"Chunking error: {str(chunk_err)}", status="FAILED_CHUNKING")
-            return False
-
-        # Step 6: Generate Embeddings via Vertex AI text-embedding-004
-        all_child_texts = [c["content"] for p in parents for c in p["children"]]
-        logger.info(f"Generating embeddings for {len(all_child_texts)} child chunks in {blob.name}...")
-        try:
-            embeddings = self.embedding_service.embed_texts(all_child_texts)
-        except Exception as emb_err:
-            logger.warning(f"Embedding error for '{blob.name}': {emb_err}. Using zero vectors.")
-            embeddings = [[0.0] * settings.EMBEDDING_DIMENSION for _ in all_child_texts]
-
-        # Step 7: Upload Parquet dataset back to GCS 'parsed/' and 'chunks/' path
-        try:
-            self.upload_parquet_dataset(
-                blob_name=blob.name,
-                metadata=metadata,
-                parents=parents,
-                embeddings=embeddings,
-                year=year,
-            )
-        except Exception as e:
-            logger.warning(f"Parquet upload warning for {blob.name}: {e}")
-
-        # Step 8: Atomic Cloud SQL / PostgreSQL Bulk Upsert
-        logger.info(f"Persisting {blob.name} into database...")
-        try:
-            self.db.load_case_payload(
-                filename=blob.name,
+            loaded = self.db.load_case_payload(
+                filename=filename,
                 gcs_uri=gcs_uri,
                 metadata=metadata,
                 parents=parents,
                 embeddings=embeddings,
                 total_pages=total_pages,
             )
-            self.db.record_ingest_complete(blob.name, total_pages, audit_note)
-            logger.info(f"Successfully ingested and indexed {blob.name} ({audit_note})")
-            return True
+            if loaded:
+                self.db.record_ingest_complete(filename, total_pages, audit_note)
+                logger.info(f"Persisted {filename} into Cloud SQL.")
         except Exception as e:
-            logger.warning(f"Failed to persist {blob.name} into Cloud SQL: {e}")
-            self.db.record_ingest_failure(blob.name, str(e), status="FAILED")
+            logger.debug(f"Cloud SQL load skipped for '{filename}': {e}")
+
+    def process_blob(self, blob: storage.Blob, year: Optional[str] = None) -> bool:
+        """
+        Processes a single PDF blob with full fault isolation, memory management, and GCS streaming.
+        Safely catches and isolates exceptions so individual corrupted PDFs never crash the batch job.
+        """
+        try:
+            logger.info(f"--- Processing GCS Blob: {blob.name} ({blob.size} bytes) ---")
+            gcs_uri = f"gs://{settings.BUCKET_NAME}/{blob.name}"
+
+            # Step 1: Download bytes into memory with size validation
+            try:
+                pdf_bytes = blob.download_as_bytes()
+            except Exception as dl_err:
+                logger.warning(f"Failed to stream blob '{blob.name}' from GCS: {dl_err}. Skipping gracefully.")
+                self._safe_record_failure(blob.name, f"Download failure: {dl_err}", status="FAILED_DOWNLOAD")
+                return False
+
+            if not pdf_bytes or len(pdf_bytes) < 100:
+                logger.warning(f"Skipping empty or truncated blob '{blob.name}' ({len(pdf_bytes or b'')} bytes)")
+                self._safe_record_failure(blob.name, "Empty file (<100 bytes)", status="FAILED_EMPTY")
+                return False
+
+            file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+
+            # Step 2: Register processing state in Cloud SQL (fail-safe)
+            self._safe_record_start(blob.name, gcs_uri, file_hash, len(pdf_bytes))
+
+            # Step 3: Strong Parsing Pass (Health Audited & Fault Isolated)
+            try:
+                parsed_res = self.parser.parse_document_resilient(pdf_bytes, blob.name)
+            except Exception as parse_err:
+                logger.warning(f"Unreadable or corrupted PDF stream in '{blob.name}': {parse_err}. Skipping gracefully.")
+                self._safe_record_failure(blob.name, f"Parse error: {parse_err}", status="CORRUPTED")
+                return False
+            finally:
+                # Explicitly release raw bytes buffer to free memory on 7K batch run
+                del pdf_bytes
+
+            if not parsed_res.get("can_ingest"):
+                logger.warning(f"Skipping {blob.name} [{parsed_res.get('status')}]: {parsed_res.get('reason')}")
+                self._safe_record_failure(
+                    filename=blob.name,
+                    error_msg=parsed_res.get("reason", "Cannot ingest"),
+                    status=parsed_res.get("status", "FAILED")
+                )
+                return False
+
+            total_pages = parsed_res["total_pages"]
+            complete_text = parsed_res["complete_text"]
+            audit_note = parsed_res["reason"]
+
+            # Step 4: Extract Judicial Metadata via Gemini 2.5 Flash
+            try:
+                metadata = self.metadata_extractor.extract_metadata(complete_text, blob.name)
+            except Exception as meta_err:
+                logger.warning(f"Metadata extraction warning for '{blob.name}': {meta_err}. Using rule fallback.")
+                metadata = self.metadata_extractor._fallback_rule_extractor(complete_text, blob.name)
+
+            # Step 5: Hierarchical Chunking (Parents ~1500 words, Children ~350 words)
+            try:
+                parents = self.chunker.chunk_document(parsed_res)
+                total_children = sum(len(p["children"]) for p in parents)
+                logger.info(f"Generated {len(parents)} parents and {total_children} child chunks for {blob.name}.")
+            except Exception as chunk_err:
+                logger.warning(f"Chunking error for '{blob.name}': {chunk_err}. Skipping gracefully.")
+                self._safe_record_failure(blob.name, f"Chunking error: {chunk_err}", status="FAILED_CHUNKING")
+                return False
+
+            # Step 6: Generate Embeddings via Vertex AI text-embedding-004
+            all_child_texts = [c["content"] for p in parents for c in p.get("children", [])]
+            try:
+                embeddings = self.embedding_service.embed_texts(all_child_texts)
+            except Exception as emb_err:
+                logger.warning(f"Embedding error for '{blob.name}': {emb_err}. Using zero vectors.")
+                embeddings = [[0.0] * settings.EMBEDDING_DIMENSION for _ in all_child_texts]
+
+            # Step 7: Upload Parquet dataset back to GCS partitioned into year=YYYY
+            try:
+                self.upload_parquet_dataset(
+                    blob_name=blob.name,
+                    metadata=metadata,
+                    parents=parents,
+                    embeddings=embeddings,
+                    year=year,
+                )
+            except Exception as pq_err:
+                logger.warning(f"Parquet upload warning for {blob.name}: {pq_err}")
+
+            # Step 8: Atomic Cloud SQL / PostgreSQL Bulk Upsert (fail-safe connection pooled)
+            self._safe_record_complete_and_load(
+                filename=blob.name,
+                gcs_uri=gcs_uri,
+                metadata=metadata,
+                parents=parents,
+                embeddings=embeddings,
+                total_pages=total_pages,
+                audit_note=audit_note,
+            )
+
+            logger.info(f"✓ Successfully processed {blob.name} ({total_pages} pages, {audit_note})")
+            return True
+
+        except Exception as unhandled_err:
+            # Global catch-all: NEVER let an unhandled error crash the 7K worker!
+            logger.error(f"Unexpected error processing '{blob.name}': {unhandled_err}. Skipping file gracefully.")
+            self._safe_record_failure(blob.name, f"Unhandled exception: {unhandled_err}", status="FAILED_UNHANDLED")
             return False
 
     def process_blobs_batch(
         self,
         target_blobs: List[storage.Blob],
         workers: int = 4,
-        year: Optional[str] = None
+        year: Optional[str] = None,
+        progress_tracker: Optional[ProgressTracker] = None,
     ) -> Tuple[int, int]:
-        """Processes a batch of PDF blobs concurrently across worker threads."""
+        """Processes a batch of PDF blobs concurrently across worker threads with fault isolation and progress tracking."""
+        if not target_blobs:
+            return 0, 0
+
         success_count = 0
         failed_count = 0
+
+        def _worker_task(blob: storage.Blob) -> Tuple[storage.Blob, bool]:
+            try:
+                ok = self.process_blob(blob, year=year)
+            except Exception as e:
+                logger.error(f"Worker task error for '{blob.name}': {e}. Skipping file.")
+                ok = False
+            if progress_tracker:
+                progress_tracker.update(blob.name, is_success=ok)
+            return blob, ok
 
         if workers > 1 and len(target_blobs) > 1:
             logger.info(f"Launching ThreadPoolExecutor with {workers} concurrent workers for {len(target_blobs)} blob(s)...")
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_blob = {executor.submit(self.process_blob, b, year): b for b in target_blobs}
+                future_to_blob = {executor.submit(_worker_task, b): b for b in target_blobs}
                 for future in as_completed(future_to_blob):
-                    b = future_to_blob[future]
                     try:
-                        res = future.result()
-                        if res:
+                        _, ok = future.result()
+                        if ok:
                             success_count += 1
                         else:
                             failed_count += 1
                     except Exception as exc:
                         failed_count += 1
-                        logger.warning(f"Worker exception processing blob '{b.name}': {exc}")
+                        logger.warning(f"Unexpected worker future exception: {exc}")
         else:
             logger.info(f"Executing sequentially (workers=1) for {len(target_blobs)} blob(s)...")
-            for idx, b in enumerate(target_blobs, 1):
-                logger.info(f"[{idx}/{len(target_blobs)}] Processing {b.name}...")
-                try:
-                    if self.process_blob(b, year=year):
-                        success_count += 1
-                    else:
-                        failed_count += 1
-                except Exception as e:
+            for b in target_blobs:
+                _, ok = _worker_task(b)
+                if ok:
+                    success_count += 1
+                else:
                     failed_count += 1
-                    logger.warning(f"Unexpected error processing {b.name}: {e}")
 
         return success_count, failed_count
 
@@ -1376,7 +1568,8 @@ class OfflineIngestionPipeline:
                 logger.warning("No PDF blobs found to process.")
                 return
             target_blobs = blobs[:limit] if limit and limit > 0 else blobs
-            self.process_blobs_batch(target_blobs, workers=workers)
+            tracker = ProgressTracker(total_files=len(target_blobs), log_interval=50, label="FLAT")
+            self.process_blobs_batch(target_blobs, workers=workers, progress_tracker=tracker)
             return
 
         # Determine target years to process
@@ -1401,6 +1594,13 @@ class OfflineIngestionPipeline:
         total_success = 0
         total_failed = 0
         year_audit_summary = {}
+
+        # Global thread-safe progress tracker for Cloud Run logs monitoring across batch execution
+        global_tracker = ProgressTracker(
+            total_files=None,
+            log_interval=50,
+            label="BATCH"
+        )
 
         # Step 2: Loop dynamically through all available years
         for yr_idx, yr in enumerate(target_years, 1):
@@ -1431,7 +1631,12 @@ class OfflineIngestionPipeline:
             )
 
             # Step 3: Parse, chunk, embed, upsert, and save parquet into year={yr} partition
-            yr_success, yr_failed = self.process_blobs_batch(target_blobs, workers=workers, year=yr)
+            yr_success, yr_failed = self.process_blobs_batch(
+                target_blobs,
+                workers=workers,
+                year=yr,
+                progress_tracker=global_tracker
+            )
 
             total_processed_pdfs += len(target_blobs)
             total_success += yr_success
@@ -1553,14 +1758,17 @@ def main():
     effective_limit = args.limit if args.limit and args.limit > 0 else 0
 
     pipeline = OfflineIngestionPipeline()
-    pipeline.run(
-        limit=effective_limit,
-        prefix=args.prefix,
-        purge_stale=args.purge_stale,
-        workers=args.workers,
-        year=args.year,
-        limit_per_year=args.limit_per_year,
-    )
+    try:
+        pipeline.run(
+            limit=effective_limit,
+            prefix=args.prefix,
+            purge_stale=args.purge_stale,
+            workers=args.workers,
+            year=args.year,
+            limit_per_year=args.limit_per_year,
+        )
+    finally:
+        pipeline.db.close()
 
 
 if __name__ == "__main__":
