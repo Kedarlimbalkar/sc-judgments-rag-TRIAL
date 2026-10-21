@@ -31,3 +31,7 @@ Thumbs.db
 *.mmd
 *.mermaid
 
+# Local documentation (kept local, not pushed)
+PARSING_AND_DATA_FORMAT.md
+Full-Rag-ARCH/
+
